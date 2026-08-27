@@ -11,25 +11,15 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { getEnginePath } from "@rivetkit/engine-cli";
 
 const ENGINE_URL = process.env.RIVET_ENDPOINT ?? "http://127.0.0.1:6420";
 const require = createRequire(import.meta.url);
 
 function engineBinary(): string {
-  const pkg = `@rivetkit/engine-cli-${process.platform}-${process.arch}`;
-  try {
-    const dir = join(require.resolve(`${pkg}/package.json`), "..");
-    const bin = join(dir, "rivet-engine");
-    if (existsSync(bin)) return bin;
-  } catch {
-    // fall through to the clearer error below
-  }
-  throw new Error(
-    `could not find the rivet engine binary (${pkg}). Run 'pnpm install', or start an engine ` +
-      `yourself and set RIVET_ENDPOINT.`,
-  );
+  // The official resolver: it knows the platform package names (linux ships a
+  // musl-static build under a -musl suffix) and honours RIVET_ENGINE_BINARY.
+  return getEnginePath();
 }
 
 async function healthy(): Promise<boolean> {

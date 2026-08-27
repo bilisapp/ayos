@@ -4,6 +4,15 @@ import { AgentOsSandbox } from "../sandbox/agentos.ts";
 
 export const PI_AGENT_ID = "pi";
 
+/**
+ * The model every job runs on unless AYOS_PI_MODEL says otherwise. Pi's
+ * bundled registry may predate this id, so it is also registered as a custom
+ * model in the VM's models.json (see configureModel) rather than merely named
+ * in settings — an id the registry cannot resolve silently falls back to Pi's
+ * own default, which is exactly the surprise we're avoiding.
+ */
+export const DEFAULT_PI_MODEL = "claude-sonnet-5";
+
 /** A `sessionEvent` row as emitted by agentOS's normalized session stream. */
 interface SessionStreamEntry {
   durability?: "durable" | "ephemeral";
@@ -48,9 +57,12 @@ export class PiSession implements AgentSession {
   }): Promise<AgentResult> {
     const { vm, conn } = this.sandbox;
 
+    await this.configureModel();
+
     await vm.sessions.open({
       sessionId: this.sessionId,
       agent: PI_AGENT_ID,
+      // model: "claude-sonnet-5",
       cwd: this.cwd,
       env: this.env,
       // Pi's ACP adapter reads an append-system-prompt only from argv and its
@@ -94,6 +106,55 @@ export class PiSession implements AgentSession {
     } finally {
       opts.signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * Pin the model before the session opens.
+   *
+   * Pi reads `~/.pi/agent/settings.json` for its default provider/model and
+   * merges `~/.pi/agent/models.json` into its registry (custom entries win).
+   * We write both: settings alone would silently fall back to Pi's bundled
+   * default whenever the bundled registry predates the requested id, and
+   * models.json requires the provider's baseUrl + apiKey when it defines
+   * models — both of which the session already holds in env.
+   */
+  private async configureModel(): Promise<void> {
+    const model = process.env.AYOS_PI_MODEL ?? DEFAULT_PI_MODEL;
+    const apiKey = this.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return;
+
+    const baseUrl = this.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
+    const agentDir = "/home/agentos/.pi/agent";
+    const { vm } = this.sandbox;
+
+    await vm.mkdir(agentDir, { recursive: true });
+    await vm.writeFile(
+      `${agentDir}/settings.json`,
+      JSON.stringify({ defaultProvider: "anthropic", defaultModel: model }),
+    );
+    await vm.writeFile(
+      `${agentDir}/models.json`,
+      JSON.stringify({
+        providers: {
+          anthropic: {
+            baseUrl,
+            apiKey,
+            api: "anthropic-messages",
+            models: [
+              {
+                id: model,
+                name: model,
+                reasoning: false,
+                input: ["text", "image"],
+                contextWindow: 200_000,
+                maxTokens: 64_000,
+                cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+              },
+            ],
+          },
+        },
+      }),
+    );
   }
 
   async dispose(): Promise<void> {

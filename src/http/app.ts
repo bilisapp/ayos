@@ -79,6 +79,14 @@ export function createApp({ config, host }: AppDeps): Hono {
     const jobId = c.req.param("id");
     const origin = c.req.header("origin");
 
+    // CORS headers go on every response — errors included — so a browser
+    // surfaces the real status ("origin not allowed", "unauthorized") instead
+    // of reporting every failure as a missing-CORS-header mystery.
+    if (config.allowedOrigin) {
+      c.header("Access-Control-Allow-Origin", config.allowedOrigin);
+      c.header("Vary", "Origin");
+    }
+
     if (!config.streamJwtPublicKey)
       return c.json({ error: "streams not configured" }, 503);
     if (origin && config.allowedOrigin && origin !== config.allowedOrigin)
@@ -91,11 +99,6 @@ export function createApp({ config, host }: AppDeps): Hono {
     if (!auth.ok) return c.json({ error: "unauthorized", reason: auth.reason }, 401);
 
     const afterSeq = Number.parseInt(c.req.header("last-event-id") ?? c.req.query("after") ?? "0", 10) || 0;
-
-    if (config.allowedOrigin) {
-      c.header("Access-Control-Allow-Origin", config.allowedOrigin);
-      c.header("Vary", "Origin");
-    }
 
     return streamSSE(c, async (stream) => {
       let unsubscribe: (() => void) | null = null;

@@ -9,3 +9,12 @@ allowBuilds:
   isolated-vm: true
   koffi: true
   protobufjs: true
+
+# The rivet engine binary is published only as a musl build, statically linked
+# so it runs on glibc hosts too. Without this, pnpm's libc filtering skips it on
+# a glibc image and the engine cannot start. We cannot simply move to Alpine:
+# agentOS's own sidecar is published as a *-gnu (glibc) binary.
+supportedArchitectures:
+  libc:
+    - current
+    - musl

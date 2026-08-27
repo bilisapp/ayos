@@ -1,10 +1,12 @@
 import { serve } from "@hono/node-server";
+import { loadDotEnv } from "./env.ts";
 import { loadConfig } from "./config.ts";
 import { createApp } from "./http/app.ts";
 import { InProcessJobHost } from "./job/inProcessHost.ts";
 import { createSandboxProvider } from "./sandbox/provider.ts";
 import { createAgentSessionFactory } from "./agent/provider.ts";
 
+loadDotEnv();
 const config = await loadConfig();
 
 const host = new InProcessJobHost({

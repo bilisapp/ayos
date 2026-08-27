@@ -17,6 +17,9 @@ importers:
       '@rivet-dev/agentos':
         specifier: ^0.2.15
         version: 0.2.15(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))(better-sqlite3@12.11.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(ws@8.21.3)
+      '@rivetkit/engine-cli':
+        specifier: 2.3.9
+        version: 2.3.9
       hono:
         specifier: ^4.6.20
         version: 4.13.5
