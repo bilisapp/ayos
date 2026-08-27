@@ -92,6 +92,14 @@ job** plus ~512 MB for the engine and Node itself, and give it at least 2 vCPU. 
 is the safety valve: above it Ayos returns `429` and the caller keeps the job queued — Ayos never
 holds a backlog, so setting this conservatively costs latency, not work.
 
+## Architecture
+
+Coolify builds the image on the deploy host, so it produces whatever that host is — no
+cross-building needed, and nothing in the Dockerfile is architecture-specific. If you instead build
+locally on an Apple Silicon Mac and push, add `--platform linux/amd64` or you will ship an arm64
+image to an x86 server. Note that emulated cross-builds recompile `isolated-vm` under QEMU and are
+very slow; building on the target host is the easier path.
+
 ## Building the image yourself
 
 ```sh
