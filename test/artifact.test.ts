@@ -58,30 +58,32 @@ describe("violatesDenylist", () => {
     expect(violatesDenylist(["deploy/prod.yaml"], ["deploy/prod.yml"])).toEqual([]);
   });
 
-  // ---- BUG (src/artifact/package.ts globToRegExp): `dir/**` compiles to
-  // ^dir/(?:.*/)?$ which only matches directory-ish paths, never a file beneath
-  // the directory. `.github/**` therefore matches NOTHING under .github/, so the
-  // spec's own example denylist entry silently fails to catch a CI edit.
-  it.fails("BUG: .github/** should match .github/workflows/ci.yml", () => {
+  it("matches every file beneath a `dir/**` entry", () => {
     expect(violatesDenylist([".github/workflows/ci.yml"], [".github/**"])).toEqual([
       ".github/workflows/ci.yml",
     ]);
-  });
-
-  it.fails("BUG: dir/** should match a file directly inside dir", () => {
     expect(violatesDenylist([".github/dependabot.yml"], [".github/**"])).toEqual([
       ".github/dependabot.yml",
     ]);
+    expect(violatesDenylist([".github/workflows/ci.yml", ".github/x.yml"], [".github/**"])).toEqual([
+      ".github/workflows/ci.yml",
+      ".github/x.yml",
+    ]);
   });
 
-  it("documents the current (broken) `**` behaviour so a fix is a visible change", () => {
-    expect(violatesDenylist([".github/workflows/ci.yml", ".github/x.yml"], [".github/**"])).toEqual(
-      [],
-    );
-  });
-
-  it("still keeps innocent paths out even under the broken ** handling", () => {
+  it("does not let a `dir/**` entry leak onto similarly-named paths", () => {
     expect(violatesDenylist(["docs/github.md", "app/Services/Env.php"], [".github/**"])).toEqual([]);
+    expect(violatesDenylist([".githubfoo/x.yml"], [".github/**"])).toEqual([]);
+  });
+
+  it("keeps `*` inside a single path segment", () => {
+    expect(violatesDenylist([".env.production"], [".env*"])).toEqual([".env.production"]);
+    expect(violatesDenylist(["config/.env.production"], [".env*"])).toEqual([]);
+  });
+
+  it("crosses segments for a leading `**/`", () => {
+    expect(violatesDenylist(["a/b/secrets.yml"], ["**/secrets.yml"])).toEqual(["a/b/secrets.yml"]);
+    expect(violatesDenylist(["secrets.yml"], ["**/secrets.yml"])).toEqual(["secrets.yml"]);
   });
 });
 
