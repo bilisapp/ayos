@@ -23,6 +23,18 @@ export const vm = agentOS<VmState, undefined, undefined, undefined, VmInput>({
     software: [pi],
     permissions: vmPermissions((c as unknown as { state: VmState }).state.egressAllowlist),
   }),
+  actions: {
+    /**
+     * Teardown has to be initiated from inside the actor — agentOS exposes no
+     * destroy action and the client handle has none, so without this the VM
+     * would only ever idle-sleep, keeping its filesystem (and the repo, and
+     * whatever the agent wrote) alive well past the end of the job.
+     */
+    shutdown: (c: { destroy(): void }) => {
+      c.destroy();
+      return "destroying";
+    },
+  },
 });
 
 export const registry = setup({ use: { vm } });
