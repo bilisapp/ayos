@@ -4,7 +4,7 @@ Founding spec for a new, small repo: **`ayos`** (Tagalog: *"fixed / in order"*, 
 
 ## Purpose
 
-Ayos is a **standalone, single-purpose execution service**: it receives a fully-formed, signed job spec, runs a coding agent (Claude Code) against a repository inside an isolated agentOS VM, and returns a **diff artifact + structured report**. It also streams live session events to authorized viewers.
+Ayos is a **standalone, single-purpose execution service**: it receives a fully-formed, signed job spec, runs a coding agent (Pi) against a repository inside an isolated agentOS VM, and returns a **diff artifact + structured report**. It also streams live session events to authorized viewers.
 
 Bilis is the first caller, but Ayos knows nothing about logs, errors, fingerprints, or teams. Any control plane that can mint the per-job credentials can use it — a CI test-fixer, a dependency upgrader, a cross-repo refactor tool.
 
@@ -19,7 +19,7 @@ Ayos is deliberately dumb:
 - Node 22+, TypeScript, ESM, pnpm.
 - `@rivet-dev/agentos` + RivetKit — one job = one Rivet Actor = one agentOS VM. Actor durability gives resume-on-restart and a persisted event buffer for free.
 - Small HTTP layer (Hono) for the job API; WebSocket/SSE for streams (prefer Rivet's native actor connections if they fit; plain SSE is an acceptable fallback).
-- Agent: Claude Code driven over agentOS's JSON-RPC/stdio session API.
+- Agent: Pi, driven over agentOS's session API.
 
 ## HTTP API
 
@@ -38,7 +38,8 @@ Job spec:
   "base_ref": "main",
   "base_sha": "abc123",             // pin the exact commit the caller saw
   "clone_token": "ghs_…",           // read-only git credential, short-lived (caller mints it)
-  "llm_key": "…",                   // Anthropic key (or gateway token), injected per job
+  "llm_key": "…",                   // model/gateway credential for the agent, injected per job
+  "llm_host": "…",                  // optional: gateway hostname, widens the VM egress allowlist
   "task": {
     "instructions": "…",            // what to do, written by the CALLER (its domain framing lives here)
     "context": "…",                 // supporting material — UNTRUSTED, delimited (see Prompt safety)
@@ -83,9 +84,9 @@ CORS on the stream endpoint: allow the configured caller origin only.
 
 States: `queued → cloning → fixing → testing → packaging → done | failed | cancelled | timeout`.
 
-1. **Provision VM** (agentOS). Configure egress allowlist: the git host (clone), `api.anthropic.com` (or the gateway host), and the package registries `test_cmd` needs (e.g. `repo.packagist.org`, `registry.npmjs.org`). Nothing else. This is the prompt-injection blast-radius control.
+1. **Provision VM** (agentOS). Configure egress allowlist: the git host (clone), the agent's LLM host (or the gateway host), and the package registries `test_cmd` needs (e.g. `repo.packagist.org`, `registry.npmjs.org`). Nothing else. This is the prompt-injection blast-radius control.
 2. **Clone** shallow: `git clone --depth 50 --filter=blob:none --single-branch --branch {base_ref}`, then checkout `base_sha`. Credential delivered via one-shot `GIT_ASKPASS` script — never written to `.git/config` or shell history. Delete the askpass file after clone.
-3. **Agent session.** Start Claude Code via agentOS JSON-RPC. Ayos's system prompt carries only the **safety invariants** (see Prompt safety); the caller's `task.instructions` carries the domain framing. Standing rules: minimal diff, run `test_cmd`, no new dependencies, never touch denylisted paths.
+3. **Agent session.** Start Pi via agentOS. Ayos's system prompt carries only the **safety invariants** (see Prompt safety); the caller's `task.instructions` carries the domain framing. Standing rules: minimal diff, run `test_cmd`, no new dependencies, never touch denylisted paths.
 4. **Verify.** Run `constraints.test_cmd` (if set); capture exit code + tail of output.
 5. **Package.** `git add -A && git diff --cached {base_sha}` → the patch. Collect a report: agent summary, files touched, test result, event count, durations, echoed `task.links`.
 6. **Callback.** POST the artifact to `callback_url` (HMAC-signed). Retry with backoff (3×); on final failure keep the artifact in actor state and expose `GET /jobs/:id/artifact` (HMAC) so the caller can pull.
@@ -153,7 +154,7 @@ No git-provider app keys, no LLM keys in env — those arrive per job. Above `MA
 src/
   index.ts            # HTTP server + Rivet registry
   actors/job.ts       # the actor: lifecycle state machine, VM driving
-  agent/session.ts    # Claude Code session wrapper (JSON-RPC)
+  agent/session.ts    # Pi session wrapper
   agent/prompt.ts     # safety-invariant system prompt + untrusted-context delimiting
   auth/hmac.ts        # sign/verify control-plane requests
   auth/streamJwt.ts   # Ed25519 verify for stream tokens
@@ -167,7 +168,7 @@ test/                 # vitest; HMAC/JWT, redaction, state machine, prompt frami
 
 1. **Walking skeleton:** POST /jobs → actor boots VM → clones a public repo → echoes a trivial agent session → artifact callback. No auth yet.
 2. **Auth + streams:** HMAC, JWT verify, SSE/WS with ring-buffer replay, redaction.
-3. **Real agent loop:** Claude Code session, prompt safety framing, test run, diff packaging, timeout/cancel.
+3. **Real agent loop:** Pi session, prompt safety framing, test run, diff packaging, timeout/cancel.
 4. **Hardening:** egress allowlist, idempotency, 429 backpressure, retry/pull fallback for callbacks, healthz, deploy (Coolify/Traefik on an `agents.` subdomain, ideally on a separate box from the caller's production services).
 
 **Prototype risk to retire first (before milestone 3):** confirm the target project's `test_cmd` actually runs inside agentOS's POSIX-on-WASM environment (PHP + SQLite likely fine; anything needing real ClickHouse is not — such projects fall back to `test_cmd: null`, with tests running in CI on the caller's PR).
@@ -179,5 +180,5 @@ test/                 # vitest; HMAC/JWT, redaction, state machine, prompt frami
 - Knowing any caller's domain vocabulary (errors, tickets, dependencies) — that lives in `task.instructions`.
 - Multi-consumer key management (`kid`-keyed secrets, per-job origins) — single caller in v1; the header format shouldn't preclude it later.
 - Retries of the *task itself* (a failed job is reported; the caller decides whether to re-attempt).
-- Supporting agents other than Claude Code in v1 (agentOS makes Codex/OpenCode a config change later).
+- Supporting agents other than Pi in v1 (agentOS makes Claude Code/Codex/OpenCode a config change later).
 

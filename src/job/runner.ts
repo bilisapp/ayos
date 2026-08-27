@@ -28,6 +28,13 @@ export interface RunnerDeps {
 const EMPTY_DURATIONS = { clone_ms: 0, agent_ms: 0, test_ms: 0 };
 
 /**
+ * Where the agent's model calls go. Overridable per job (`llm_host`) and per
+ * deployment (`deps.llmHost`) — it is only the fallback, and it is the single
+ * place to change if the agent runtime talks to a different endpoint.
+ */
+export const DEFAULT_LLM_HOST = "api.anthropic.com";
+
+/**
  * Drives one job start to finish. Never throws: every failure path produces an
  * artifact, because the caller is waiting for exactly one of those.
  */
@@ -97,7 +104,7 @@ export async function runJob(
   try {
     // 1. Provision, with egress narrowed to exactly what this job needs.
     const gitHost = deps.gitHost ?? "github.com";
-    const llmHost = deps.llmHost ?? "api.anthropic.com";
+    const llmHost = spec.llm_host ?? deps.llmHost ?? DEFAULT_LLM_HOST;
     const egress = egressAllowlistFor({
       gitHost,
       llmHost,

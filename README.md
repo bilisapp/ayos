@@ -53,7 +53,7 @@ connect time only; an established stream is not killed when the token expires.
 ## Status
 
 - Core modules, HTTP layer, lifecycle state machine, prompt safety, auth, redaction: **done**.
-- Rivet actor host and the agentOS/Claude Code adapters: **in progress** — the runner is written
+- Rivet actor host and the agentOS/Pi adapters: **in progress** — the runner is written
   against the `Sandbox` / `AgentSession` interfaces so those are drop-in.
 
 ## Non-goals

@@ -8,6 +8,9 @@ export const JobSpec = z.object({
   base_sha: z.string().regex(/^[0-9a-f]{7,40}$/, "base_sha must be a hex commit sha"),
   clone_token: z.string().min(1),
   llm_key: z.string().min(1),
+  // Optional gateway override. It widens the VM's egress allowlist, so only the
+  // caller (which mints llm_key and knows where it is valid) may set it.
+  llm_host: z.string().regex(/^[a-z0-9.-]+$/i, "llm_host must be a bare hostname").optional(),
   task: z.object({
     instructions: z.string().min(1),
     context: z.string().default(""),

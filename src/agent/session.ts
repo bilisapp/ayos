@@ -2,9 +2,9 @@ import type { Sandbox } from "../sandbox.ts";
 import type { EventType } from "../events/schema.ts";
 
 /**
- * What the lifecycle needs from a coding agent. agentOS drives Claude Code over
- * JSON-RPC/stdio; this interface is what that adapter must satisfy, and what a
- * fake satisfies in tests.
+ * What the lifecycle needs from a coding agent. The real implementation drives
+ * Pi inside an agentOS VM; this interface is what that adapter must satisfy,
+ * and what a fake satisfies in tests.
  */
 export interface AgentTurn {
   type: Extract<EventType, "agent_message" | "tool_call" | "tool_result" | "error">;
