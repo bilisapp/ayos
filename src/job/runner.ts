@@ -145,6 +145,7 @@ export async function runJob(
       sandbox,
       cwd: WORKDIR,
       llmKey: spec.llm_key,
+      llmHost: spec.llm_host,
       signal: controller.signal,
     });
     try {

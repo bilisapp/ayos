@@ -34,6 +34,8 @@ export interface AgentSessionFactory {
     sandbox: Sandbox;
     cwd: string;
     llmKey: string;
+    /** Gateway hostname, when the caller routes model traffic through its own. */
+    llmHost?: string;
     signal?: AbortSignal;
   }): Promise<AgentSession>;
 }

@@ -1,2 +1,16 @@
+allowBuilds:
+  '@google/genai': set this to true or false
+  better-sqlite3: set this to true or false
+  cbor-extract: set this to true or false
+  esbuild: set this to true or false
+  isolated-vm: set this to true or false
+  koffi: set this to true or false
+  protobufjs: set this to true or false
 onlyBuiltDependencies:
   - esbuild
+  - better-sqlite3
+  - isolated-vm
+  - koffi
+  - cbor-extract
+  - protobufjs
+  - "@google/genai"
