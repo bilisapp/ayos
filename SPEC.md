@@ -75,7 +75,9 @@ Liveness for the reverse proxy.
 
 Two boundaries, two mechanisms:
 
-1. **Caller ↔ Ayos (control plane):** shared-secret HMAC over the raw body (`X-Ayos-Signature: sha256=…`) plus `X-Ayos-Timestamp` with a ±5 min window. Same secret in both directions (job dispatch and artifact callback).
+1. **Caller ↔ Ayos (control plane):** shared-secret HMAC over the raw body (`X-Ayos-Signature: sha256=…`) plus `X-Ayos-Timestamp` — Unix seconds — with a ±5 min window. Same secret in both directions (job dispatch and artifact callback). A PHP-generated golden vector is pinned in `test/hmac.test.ts`, because a silent divergence here 401s every call between the two services.
+
+   *Known weakness:* the timestamp is **not** covered by the MAC, so a captured request can be replayed with a fresh timestamp. The damage is bounded — a replayed dispatch is idempotent on `job_id`, and a replayed callback re-delivers an artifact the caller already has — but signing `{timestamp}.{body}` instead would close it. That is a coordinated change on both sides, not a unilateral one.
 2. **Browser → Ayos (streams):** Ed25519 JWT minted by the caller. Ayos holds **only the public key** — it can verify but never mint. Claims: `sub` (viewer id, for audit), `job` (the single job this token may watch), `scope: "stream:read"`, `exp` (~10 min). Reject if `claims.job !== :id`.
 
 CORS on the stream endpoint: allow the configured caller origin only.
