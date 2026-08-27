@@ -5,7 +5,7 @@ import type { JobHost } from "../job/host.ts";
 import { JobSpec } from "../types.ts";
 import { SIGNATURE_HEADER, TIMESTAMP_HEADER, verify } from "../auth/hmac.ts";
 import { verifyStreamToken } from "../auth/streamJwt.ts";
-import type { JobEvent } from "../events/schema.ts";
+import type { JobStreamEvent } from "../events/schema.ts";
 
 export interface AppDeps {
   config: Config;
@@ -103,7 +103,7 @@ export function createApp({ config, host }: AppDeps): Hono {
     return streamSSE(c, async (stream) => {
       let unsubscribe: (() => void) | null = null;
       let closed = false;
-      const queue: JobEvent[] = [];
+      const queue: JobStreamEvent[] = [];
       let notify: (() => void) | null = null;
 
       stream.onAbort(() => {
@@ -125,7 +125,7 @@ export function createApp({ config, host }: AppDeps): Hono {
         while (queue.length) {
           const event = queue.shift()!;
           await stream.writeSSE({
-            id: String(event.seq),
+            ...("seq" in event ? { id: String(event.seq) } : {}),
             event: event.type,
             data: JSON.stringify(event),
           });

@@ -9,6 +9,8 @@ import type { EventType } from "../events/schema.ts";
 export interface AgentTurn {
   type: Extract<EventType, "agent_message" | "tool_call" | "tool_result" | "error">;
   data: Record<string, unknown>;
+  /** Ephemeral turns are live-only deltas and should not be persisted. */
+  durability?: "durable" | "ephemeral";
 }
 
 export interface AgentResult {

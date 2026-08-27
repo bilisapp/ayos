@@ -1,7 +1,7 @@
 import type { JobHost, JobSnapshot } from "./host.ts";
 import type { JobSpec, Artifact, JobState } from "../types.ts";
 import { isTerminal } from "../types.ts";
-import type { JobEvent } from "../events/schema.ts";
+import type { JobEvent, JobStreamEvent } from "../events/schema.ts";
 import { RingBuffer } from "../events/ringBuffer.ts";
 import { runJob, type RunnerDeps } from "./runner.ts";
 import { deliverArtifact } from "../artifact/callback.ts";
@@ -10,7 +10,7 @@ interface JobRecord {
   spec: JobSpec;
   snapshot: JobSnapshot;
   buffer: RingBuffer;
-  subscribers: Set<(event: JobEvent) => void>;
+  subscribers: Set<(event: JobStreamEvent) => void>;
   abort: AbortController;
   artifact: Artifact | null;
   done: Promise<void>;
@@ -53,8 +53,7 @@ export class InProcessJobHost implements JobHost {
   }
 
   private async execute(record: JobRecord): Promise<void> {
-    const emit = (type: JobEvent["type"], data: Record<string, unknown>) => {
-      const event = record.buffer.push({ type, data });
+    const publish = (event: JobStreamEvent) => {
       for (const sub of record.subscribers) {
         try {
           sub(event);
@@ -62,6 +61,20 @@ export class InProcessJobHost implements JobHost {
           // A broken subscriber must never take the job down.
         }
       }
+    };
+
+    const emit = (
+      type: JobEvent["type"],
+      data: Record<string, unknown>,
+      options: { durability?: "durable" | "ephemeral" } = {},
+    ) => {
+      if (options.durability === "ephemeral") {
+        publish({ durability: "ephemeral", ts: new Date().toISOString(), type, data });
+        return;
+      }
+
+      const event = record.buffer.push({ type, data });
+      publish(event);
     };
 
     const artifact = await runJob(
@@ -112,7 +125,7 @@ export class InProcessJobHost implements JobHost {
   async subscribe(
     jobId: string,
     afterSeq: number,
-    onEvent: (event: JobEvent) => void,
+    onEvent: (event: JobStreamEvent) => void,
   ): Promise<(() => void) | null> {
     const record = this.jobs.get(jobId);
     if (!record) return null;
@@ -133,5 +146,39 @@ export class InProcessJobHost implements JobHost {
   /** Test helper: wait for a job's pipeline (including callback) to settle. */
   async waitFor(jobId: string): Promise<void> {
     await this.jobs.get(jobId)?.done;
+  }
+
+  /**
+   * Cancels every in-flight job and waits for each pipeline to unwind, which is
+   * what actually disposes the sandboxes — and with them destroys the VM actors.
+   * Shutdown must do this BEFORE the registry goes down: a live actor torn down
+   * by the engine loses the race against its own final state persist and fails
+   * with "SQLite transaction coordinator is closed".
+   *
+   * Bounded, because a wedged job (or a callback still retrying) must not hold
+   * a tsx-watch restart hostage. On timeout the caller proceeds anyway.
+   */
+  async drain(timeoutMs: number): Promise<{ drained: boolean; pending: number }> {
+    const inFlight: Promise<void>[] = [];
+    for (const record of this.jobs.values()) {
+      if (isTerminal(record.snapshot.state)) continue;
+      record.abort.abort("cancelled");
+      inFlight.push(record.done);
+    }
+    if (inFlight.length === 0) return { drained: true, pending: 0 };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    try {
+      const drained = await Promise.race([
+        Promise.allSettled(inFlight).then(() => true as const),
+        deadline,
+      ]);
+      return { drained, pending: inFlight.length };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

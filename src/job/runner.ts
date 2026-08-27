@@ -15,7 +15,11 @@ import { makeRedactor } from "../events/redact.ts";
 import { truncateText, MAX_TOOL_RESULT_BYTES, type EventType } from "../events/schema.ts";
 
 export interface EmitFn {
-  (type: EventType, data: Record<string, unknown>): void;
+  (
+    type: EventType,
+    data: Record<string, unknown>,
+    options?: { durability?: "durable" | "ephemeral" },
+  ): void;
 }
 
 export interface RunnerDeps {
@@ -73,8 +77,8 @@ export async function runJob(
   externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
   const timer = setTimeout(() => abortFor("timeout"), timeoutMs);
 
-  const emit: EmitFn = (type, data) =>
-    deps.emit(type, redactor.redactValue(data) as Record<string, unknown>);
+  const emit: EmitFn = (type, data, options) =>
+    deps.emit(type, redactor.redactValue(data) as Record<string, unknown>, options);
 
   const setState = (next: JobState) => {
     state = next;
@@ -94,6 +98,7 @@ export async function runJob(
       diff,
       report: {
         summary: redactor.redactString(summary || extra?.error || ""),
+        error: extra?.error ? redactor.redactString(extra.error) : null,
         files_touched: filesTouched,
         tests: tests
           ? { cmd: tests.cmd, passed: tests.passed, output_tail: tests.output_tail }
@@ -181,7 +186,7 @@ export async function runJob(
             turn.type === "tool_result"
               ? { ...turn.data, output: truncateText(String(turn.data.output ?? ""), MAX_TOOL_RESULT_BYTES) }
               : turn.data;
-          emit(turn.type, data);
+          emit(turn.type, data, { durability: turn.durability });
         },
       });
       summary = result.summary;

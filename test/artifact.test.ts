@@ -346,6 +346,7 @@ function artifact(): Artifact {
     diff: `${DIFF_HEADER}\n+fixed\n`,
     report: {
       summary: "Fixed it.",
+      error: null,
       files_touched: ["app/Foo.php"],
       tests: { cmd: "php artisan test", passed: true, output_tail: "OK" },
       durations: { clone_ms: 10, agent_ms: 20, test_ms: 30 },

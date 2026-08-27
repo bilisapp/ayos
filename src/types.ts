@@ -50,6 +50,8 @@ export interface Artifact {
   diff: string | null;
   report: {
     summary: string;
+    /** The failure, verbatim, when there was one — never the agent's prose. */
+    error: string | null;
     files_touched: string[];
     tests: { cmd: string | null; passed: boolean | null; output_tail: string } | null;
     durations: { clone_ms: number; agent_ms: number; test_ms: number };

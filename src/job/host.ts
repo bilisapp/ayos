@@ -1,5 +1,5 @@
 import type { JobSpec, Artifact, JobState } from "../types.ts";
-import type { JobEvent } from "../events/schema.ts";
+import type { JobStreamEvent } from "../events/schema.ts";
 
 export interface JobSnapshot {
   job_id: string;
@@ -18,13 +18,13 @@ export interface JobHost {
   cancel(jobId: string): Promise<boolean>;
   artifact(jobId: string): Promise<Artifact | null>;
   /**
-   * Replay events after `afterSeq`, then live ones. The returned function
-   * unsubscribes.
+   * Replay durable events after `afterSeq`, then live events. Ephemeral live
+   * deltas are never replayed. The returned function unsubscribes.
    */
   subscribe(
     jobId: string,
     afterSeq: number,
-    onEvent: (event: JobEvent) => void,
+    onEvent: (event: JobStreamEvent) => void,
   ): Promise<(() => void) | null>;
   activeCount(): Promise<number>;
 }

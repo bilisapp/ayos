@@ -18,8 +18,11 @@ interface SessionStreamEntry {
   durability?: "durable" | "ephemeral";
   sessionId?: string;
   sequence?: number;
+  afterSequence?: number;
+  timestamp?: string;
   type?: string;
   content?: unknown;
+  messageId?: string | null;
   toolCallId?: string;
   title?: string;
   status?: string;
@@ -38,13 +41,25 @@ function textOf(content: unknown): string {
   return "";
 }
 
+/**
+ * The one session every job uses. agentOS defaults to "main" when no
+ * sessionId is given, and its event fan-out is keyed by EXACT session id:
+ * the wrapper subscribes under the id passed to open/prompt, while the ACP
+ * sidecar tags events with its own notion of the session's id. Naming the
+ * session after the job put those two out of agreement and silently dropped
+ * every sessionEvent broadcast. The VM is one-job/one-session, so the
+ * documented default is the only id we ever need.
+ */
+const SESSION_ID = "main";
+
 export class PiSession implements AgentSession {
   private unsubscribe: (() => void) | null = null;
   private opened = false;
+  private readonly messageDeltas = new Map<string, string>();
 
   constructor(
     private readonly sandbox: AgentOsSandbox,
-    private readonly sessionId: string,
+    private readonly jobId: string,
     private readonly cwd: string,
     private readonly env: Record<string, string>,
   ) {}
@@ -59,8 +74,17 @@ export class PiSession implements AgentSession {
 
     await this.configureModel();
 
+    // Register the local actor-event listener before opening the session. The
+    // VM is one-job/one-session, so do not filter by `sessionId`: older
+    // agentOS/Pi combinations can surface the adapter/private ID here while the
+    // public ID is still the one used for actions and history.
+    this.unsubscribe = conn.on("sessionEvent", (payload: unknown) => {
+      const turn = toTurn(payload as SessionStreamEntry, this.messageDeltas);
+      if (turn) opts.onTurn(turn);
+    });
+
     await vm.sessions.open({
-      sessionId: this.sessionId,
+      sessionId: SESSION_ID,
       agent: PI_AGENT_ID,
       // model: "claude-sonnet-5",
       cwd: this.cwd,
@@ -75,27 +99,18 @@ export class PiSession implements AgentSession {
     });
     this.opened = true;
 
-    // Live turns. Ephemeral and durable entries carry the same text, so we take
-    // only durable ones — replay and live then agree, and nothing is doubled.
-    this.unsubscribe = conn.on("sessionEvent", (payload: unknown) => {
-      const entry = payload as SessionStreamEntry;
-      if (entry.durability === "ephemeral") return;
-      const turn = toTurn(entry);
-      if (turn) opts.onTurn(turn);
-    });
-
     const onAbort = () => {
-      void vm.sessions.cancelPrompt({ sessionId: this.sessionId }).catch(() => {});
+      void vm.sessions.cancelPrompt({ sessionId: SESSION_ID }).catch(() => {});
     };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       const result = await vm.sessions.prompt({
-        sessionId: this.sessionId,
+        sessionId: SESSION_ID,
         // Ayos generates one prompt per job, so the job id is a natural
         // idempotency key: a retried prompt returns the same message rather
         // than paying for a second run.
-        idempotencyKey: this.sessionId,
+        idempotencyKey: this.jobId,
         content: [{ type: "text", text: framePrompt(opts.systemPrompt, opts.userPrompt) }],
       });
 
@@ -161,7 +176,7 @@ export class PiSession implements AgentSession {
     this.unsubscribe?.();
     this.unsubscribe = null;
     if (this.opened) {
-      await this.sandbox.vm.sessions.delete({ sessionId: this.sessionId }).catch(() => {});
+      await this.sandbox.vm.sessions.delete({ sessionId: SESSION_ID }).catch(() => {});
       this.opened = false;
     }
   }
@@ -185,21 +200,57 @@ export function framePrompt(systemPrompt: string, userPrompt: string): string {
   ].join("\n");
 }
 
-function toTurn(entry: SessionStreamEntry): AgentTurn | null {
+function messageStreamId(entry: SessionStreamEntry): string {
+  if (entry.messageId) return `agent-message:${entry.messageId}`;
+  if (typeof entry.afterSequence === "number") return `agent-message:after-${entry.afterSequence}`;
+  if (typeof entry.sequence === "number") return `agent-message:sequence-${entry.sequence}`;
+  return "agent-message:current";
+}
+
+function toTurn(entry: SessionStreamEntry, messageDeltas: Map<string, string>): AgentTurn | null {
   switch (entry.type) {
-    case "agent_message_chunk":
-      return { type: "agent_message", data: { text: textOf(entry.content) } };
+    case "agent_message_chunk": {
+      const streamId = messageStreamId(entry);
+      const chunk = textOf(entry.content);
+      const text =
+        entry.durability === "ephemeral"
+          ? `${messageDeltas.get(streamId) ?? ""}${chunk}`
+          : chunk;
+
+      if (entry.durability === "ephemeral") messageDeltas.set(streamId, text);
+      // A durable chunk commits the whole message, so every accumulated delta
+      // is stale — including ones filed under a different key, since the
+      // ephemeral and durable copies of one message do not always agree on
+      // messageId/afterSequence. One prompt runs at a time, so clearing all
+      // of them can only drop text that was already superseded; deleting only
+      // this key left the old message's text to be prepended to the next one.
+      else messageDeltas.clear();
+
+      return {
+        type: "agent_message",
+        durability: entry.durability,
+        data: {
+          text,
+          stream_id: streamId,
+          session_sequence: entry.sequence,
+          after_session_sequence: entry.afterSequence,
+        },
+      };
+    }
     case "agent_thought_chunk":
       // Thinking is not shown to viewers — it is noisy and can echo the context.
       return null;
     case "tool_call":
       return {
         type: "tool_call",
+        durability: entry.durability,
         data: {
           tool_call_id: entry.toolCallId,
           title: entry.title,
+          name: entry.title,
           status: entry.status,
           input: entry.rawInput,
+          session_sequence: entry.sequence,
         },
       };
     case "tool_call_update":
@@ -208,6 +259,7 @@ function toTurn(entry: SessionStreamEntry): AgentTurn | null {
       if (entry.status !== "completed" && entry.status !== "failed") return null;
       return {
         type: "tool_result",
+        durability: entry.durability,
         data: {
           tool_call_id: entry.toolCallId,
           status: entry.status,
@@ -220,6 +272,7 @@ function toTurn(entry: SessionStreamEntry): AgentTurn | null {
                 )
               : entry.content,
           ),
+          session_sequence: entry.sequence,
         },
       };
     case "user_message_chunk":
