@@ -30,7 +30,7 @@ pnpm dev
 | `src/auth/hmac.ts` | Control-plane signing/verification (both directions) |
 | `src/auth/streamJwt.ts` | Ed25519 verification for browser stream tokens (verify only — Ayos never mints) |
 | `src/events/` | Event schema, ring buffer, secret redaction |
-| `src/git/clone.ts` | Shallow clone at a pinned sha via one-shot `GIT_ASKPASS` |
+| `src/git/clone.ts` | Host-side shallow clone at a pinned sha via one-shot `GIT_ASKPASS`; the checkout is mounted into the VM |
 | `src/artifact/` | Diff packaging, test run, denylist enforcement, signed callback with retries |
 
 ## Calling it
@@ -53,8 +53,20 @@ connect time only; an established stream is not killed when the token expires.
 ## Status
 
 - Core modules, HTTP layer, lifecycle state machine, prompt safety, auth, redaction: **done**.
-- Rivet actor host and the agentOS/Pi adapters: **in progress** — the runner is written
-  against the `Sandbox` / `AgentSession` interfaces so those are drop-in.
+- agentOS VM and Pi session adapters: **done**, built against the shipped type definitions and
+  verified against a live VM. Not yet exercised end-to-end with real credentials.
+- Durable Rivet job actor: **not started** — `InProcessJobHost` implements the same `JobHost`
+  interface, so it is a swap rather than a rewrite.
+
+### Two constraints worth knowing before you read the code
+
+**Pi has no system-prompt channel.** `additionalInstructions` never reaches the model, so Ayos's
+safety invariants ride at the head of the first user turn. The nonce fence around untrusted
+context still does the real separation work.
+
+**The VM has no git and no language runtimes.** The clone therefore happens on the host and is
+mounted in — which also keeps the clone token out of the VM entirely. A `test_cmd` needing php,
+node or python fails the job with an explicit message; use `test_cmd: null` and verify in CI.
 
 ## Non-goals
 

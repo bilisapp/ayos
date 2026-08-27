@@ -1,7 +1,13 @@
-import type { Sandbox } from "../sandbox.ts";
+import { execFile } from "node:child_process";
+import { mkdtemp, writeFile, rm, chmod } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 
+const run = promisify(execFile);
+
+/** Where the host clone is mounted inside the VM. */
 export const WORKDIR = "/work/repo";
-const ASKPASS_PATH = "/tmp/ayos-askpass.sh";
 
 export interface CloneOptions {
   repo: string;
@@ -11,6 +17,13 @@ export interface CloneOptions {
   host?: string;
   depth?: number;
   signal?: AbortSignal;
+}
+
+export interface Checkout {
+  /** Absolute host path of the clone — this is what gets mounted into the VM. */
+  hostPath: string;
+  durationMs: number;
+  cleanup(): Promise<void>;
 }
 
 export class CloneError extends Error {
@@ -23,76 +36,122 @@ export class CloneError extends Error {
   }
 }
 
+function stderrOf(err: unknown): string {
+  if (err && typeof err === "object" && "stderr" in err)
+    return String((err as { stderr: unknown }).stderr ?? "");
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
- * Shallow clone at a pinned sha. The token is handed to git through a one-shot
- * GIT_ASKPASS script and deleted immediately after — it never reaches
- * .git/config, the remote URL, or shell history.
+ * Clones on the HOST, not in the VM: agentOS ships no working git today (the
+ * git package registers but every invocation fails), so the clone happens here
+ * and the tree is mounted into the VM.
+ *
+ * This is also the better security position. The clone token never enters the
+ * VM at all, so the agent cannot reach it even if the prompt fence fails —
+ * previously it was one `cat` away from a credential.
+ *
+ * The token still never reaches argv or .git/config: it goes through a one-shot
+ * GIT_ASKPASS script that is deleted immediately after the clone.
  */
-export async function shallowClone(
-  sandbox: Sandbox,
-  opts: CloneOptions,
-): Promise<{ dir: string; durationMs: number }> {
+export async function shallowClone(opts: CloneOptions): Promise<Checkout> {
   const host = opts.host ?? "github.com";
   const depth = opts.depth ?? 50;
   const started = Date.now();
 
+  const dir = await mkdtemp(join(tmpdir(), "ayos-"));
+  const repoPath = join(dir, "repo");
+  const askpassPath = join(dir, "askpass.sh");
+
+  const cleanup = async () => {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  };
+
   // git calls this twice: once for username, once for password.
-  await sandbox.writeFile(
-    ASKPASS_PATH,
-    ["#!/bin/sh", 'case "$1" in', "*Username*) echo x-access-token ;;", '*) printf "%s" "$AYOS_GIT_TOKEN" ;;', "esac", ""].join("\n"),
-    { mode: 0o700 },
+  await writeFile(
+    askpassPath,
+    [
+      "#!/bin/sh",
+      'case "$1" in',
+      "*Username*) echo x-access-token ;;",
+      '*) printf "%s" "$AYOS_GIT_TOKEN" ;;',
+      "esac",
+      "",
+    ].join("\n"),
   );
+  await chmod(askpassPath, 0o700);
 
   const env = {
-    GIT_ASKPASS: ASKPASS_PATH,
+    ...process.env,
+    GIT_ASKPASS: askpassPath,
     AYOS_GIT_TOKEN: opts.cloneToken,
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
   };
+  const gitOpts = { env, signal: opts.signal, maxBuffer: 16 * 1024 * 1024 };
 
   try {
-    const clone = await sandbox.exec(
-      "git",
-      [
-        "clone",
-        "--depth",
-        String(depth),
-        "--filter=blob:none",
-        "--single-branch",
-        "--branch",
-        opts.baseRef,
-        `https://${host}/${opts.repo}.git`,
-        WORKDIR,
-      ],
-      { env, signal: opts.signal },
-    );
-    if (clone.exitCode !== 0) throw new CloneError(`git clone failed (${clone.exitCode})`, clone.stderr);
-
-    // The branch tip may have moved since the caller read base_sha; fetch it explicitly.
-    const checkout = await sandbox.exec("git", ["checkout", "--detach", opts.baseSha], {
-      cwd: WORKDIR,
-      env,
-      signal: opts.signal,
-    });
-    if (checkout.exitCode !== 0) {
-      const fetch = await sandbox.exec("git", ["fetch", "--depth", String(depth), "origin", opts.baseSha], {
-        cwd: WORKDIR,
-        env,
-        signal: opts.signal,
-      });
-      if (fetch.exitCode !== 0)
-        throw new CloneError(`base_sha ${opts.baseSha} not reachable`, fetch.stderr || checkout.stderr);
-      const retry = await sandbox.exec("git", ["checkout", "--detach", opts.baseSha], {
-        cwd: WORKDIR,
-        env,
-        signal: opts.signal,
-      });
-      if (retry.exitCode !== 0) throw new CloneError(`checkout ${opts.baseSha} failed`, retry.stderr);
+    try {
+      await run(
+        "git",
+        [
+          "clone",
+          "--depth",
+          String(depth),
+          "--filter=blob:none",
+          "--single-branch",
+          "--branch",
+          opts.baseRef,
+          `https://${host}/${opts.repo}.git`,
+          repoPath,
+        ],
+        gitOpts,
+      );
+    } catch (err) {
+      throw new CloneError("git clone failed", stderrOf(err));
     }
 
-    return { dir: WORKDIR, durationMs: Date.now() - started };
+    // The branch tip may have moved since the caller read base_sha, so fall
+    // back to fetching that exact commit.
+    try {
+      await run("git", ["checkout", "--detach", opts.baseSha], { ...gitOpts, cwd: repoPath });
+    } catch {
+      try {
+        await run("git", ["fetch", "--depth", String(depth), "origin", opts.baseSha], {
+          ...gitOpts,
+          cwd: repoPath,
+        });
+        await run("git", ["checkout", "--detach", opts.baseSha], { ...gitOpts, cwd: repoPath });
+      } catch (err) {
+        throw new CloneError(`base_sha ${opts.baseSha} not reachable`, stderrOf(err));
+      }
+    }
+
+    return { hostPath: repoPath, durationMs: Date.now() - started, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
   } finally {
-    // Best effort: the VM is disposable, but don't leave a token on disk for the agent to find.
-    await sandbox.remove(ASKPASS_PATH).catch(() => {});
+    // Never leave a credential on disk, even briefly, even though the VM can't
+    // see this directory.
+    await rm(askpassPath, { force: true }).catch(() => {});
+  }
+}
+
+/** Runs a git command against a host checkout. Never throws on nonzero exit. */
+export async function git(
+  cwd: string,
+  args: string[],
+): Promise<{ stdout: string; stderr: string; ok: boolean }> {
+  try {
+    const { stdout, stderr } = await run("git", args, {
+      cwd,
+      maxBuffer: 64 * 1024 * 1024,
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+    });
+    return { stdout, stderr, ok: true };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string };
+    return { stdout: e.stdout ?? "", stderr: e.stderr ?? stderrOf(err), ok: false };
   }
 }

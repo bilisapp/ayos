@@ -1,6 +1,7 @@
+import { git } from "../git/clone.ts";
+import { truncateText } from "../events/schema.ts";
 import type { Sandbox } from "../sandbox.ts";
 import { WORKDIR } from "../git/clone.ts";
-import { truncateText } from "../events/schema.ts";
 
 export interface DiffResult {
   diff: string;
@@ -11,24 +12,25 @@ export interface DiffResult {
 
 /**
  * Stage everything (so new files appear) and diff against the pinned base.
- * Ayos never commits — the caller owns the write path.
+ *
+ * Runs on the HOST against the checkout the VM has mounted: the agent's edits
+ * land in that directory through the mount, and the host has real git. Ayos
+ * never commits — the caller owns the write path.
  */
 export async function packageDiff(
-  sandbox: Sandbox,
+  hostPath: string,
   baseSha: string,
   maxDiffLines: number,
 ): Promise<DiffResult> {
-  await sandbox.exec("git", ["add", "-A"], { cwd: WORKDIR });
+  await git(hostPath, ["add", "-A"]);
 
-  const names = await sandbox.exec("git", ["diff", "--cached", "--name-only", baseSha], {
-    cwd: WORKDIR,
-  });
+  const names = await git(hostPath, ["diff", "--cached", "--name-only", baseSha]);
   const filesTouched = names.stdout
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const out = await sandbox.exec("git", ["diff", "--cached", baseSha], { cwd: WORKDIR });
+  const out = await git(hostPath, ["diff", "--cached", baseSha]);
   const diff = out.stdout;
   const lines = diff ? diff.split("\n") : [];
 
@@ -52,6 +54,10 @@ export interface TestRun {
 
 const TAIL_BYTES = 8192;
 
+/**
+ * Runs the caller's test command inside the VM, against the mounted checkout.
+ * Never throws on a failing test — a red suite is a result, not an error.
+ */
 export async function runTests(
   sandbox: Sandbox,
   cmd: string,
@@ -72,6 +78,38 @@ export async function runTests(
   };
 }
 
+/**
+ * The binary a test command needs on PATH. agentOS's guest ships coreutils and
+ * friends but no language runtimes, so this is what the preflight check looks
+ * for before we let a job get as far as reporting a confusing test failure.
+ */
+export function requiredToolFor(testCmd: string): string | null {
+  const first = testCmd.trim().split(/\s+/)[0] ?? "";
+  const bin = first.split("/").at(-1) ?? "";
+  // Shell builtins and coreutils are always present; only runtimes are at risk.
+  const RUNTIMES = new Set([
+    "php",
+    "node",
+    "npm",
+    "pnpm",
+    "yarn",
+    "npx",
+    "python",
+    "python3",
+    "pytest",
+    "ruby",
+    "bundle",
+    "go",
+    "cargo",
+    "java",
+    "mvn",
+    "gradle",
+    "dotnet",
+    "composer",
+  ]);
+  return RUNTIMES.has(bin) ? bin : null;
+}
+
 /** Paths the caller forbade. The agent was told; this checks whether it listened. */
 export function violatesDenylist(files: string[], denylist: string[]): string[] {
   if (!denylist.length) return [];
@@ -85,7 +123,6 @@ export function violatesDenylist(files: string[], denylist: string[]): string[] 
  * by the next.
  *
  *   `.github/**`  -> the directory and everything under it
- *   `**` + `/x`   -> any depth
  *   `.env*`       -> one path segment only
  */
 function globToRegExp(glob: string): RegExp {

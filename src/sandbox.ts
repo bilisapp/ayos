@@ -30,6 +30,8 @@ export interface SandboxProvisionOptions {
   jobId: string;
   /** Hosts the VM may reach. Everything else is denied — the blast-radius control. */
   egressAllowlist: string[];
+  /** Host directory holding the checkout, mounted read-write into the VM. */
+  hostRepoPath: string;
   env?: Record<string, string>;
   signal?: AbortSignal;
 }
@@ -38,13 +40,12 @@ export interface SandboxProvider {
   provision(opts: SandboxProvisionOptions): Promise<Sandbox>;
 }
 
-/** Hosts a job needs: the git host, the LLM endpoint, and test-time registries. */
-export function egressAllowlistFor(opts: {
-  gitHost: string;
-  llmHost: string;
-  registries?: string[];
-}): string[] {
-  return [...new Set([opts.gitHost, opts.llmHost, ...(opts.registries ?? [])])];
+/**
+ * Hosts a job needs. The git host is deliberately absent: the clone happens on
+ * the host before the VM boots, so the agent has no reason to reach it.
+ */
+export function egressAllowlistFor(opts: { llmHost: string; registries?: string[] }): string[] {
+  return [...new Set([opts.llmHost, ...(opts.registries ?? [])])];
 }
 
 /** Registries a test command plausibly needs. Conservative: no match → nothing added. */

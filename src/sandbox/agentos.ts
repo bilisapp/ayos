@@ -160,7 +160,10 @@ export class AgentOsSandboxProvider implements SandboxProvider {
 
   async provision(options: SandboxProvisionOptions): Promise<Sandbox> {
     const handle = this.opts.client.vm.getOrCreate([options.jobId], {
-      createWithInput: { egressAllowlist: options.egressAllowlist },
+      createWithInput: {
+        egressAllowlist: options.egressAllowlist,
+        hostRepoPath: options.hostRepoPath,
+      },
     });
     const conn = handle.connect();
     await conn.ready;
@@ -186,7 +189,6 @@ export class AgentOsSandboxProvider implements SandboxProvider {
       }
     }
 
-    await handle.mkdir("/work", { recursive: true });
     return sandbox;
   }
 }

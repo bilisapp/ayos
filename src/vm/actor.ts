@@ -1,10 +1,13 @@
-import { agentOS, setup } from "@rivet-dev/agentos";
+import { agentOS, setup, createHostDirBackend } from "@rivet-dev/agentos";
 import pi from "@agentos-software/pi";
 import { vmPermissions } from "../sandbox/permissions.ts";
+import { WORKDIR } from "../git/clone.ts";
 
 export interface VmInput {
   /** Hosts this VM may reach. Everything else is denied. */
   egressAllowlist: string[];
+  /** Host path of the checkout to mount at WORKDIR. */
+  hostRepoPath: string;
 }
 
 /**
@@ -15,14 +18,32 @@ export interface VmInput {
  */
 export interface VmState {
   egressAllowlist: string[];
+  hostRepoPath: string;
 }
 
 export const vm = agentOS<VmState, undefined, undefined, undefined, VmInput>({
-  createState: (_c, input) => ({ egressAllowlist: input?.egressAllowlist ?? [] }),
-  resolveOptions: (c) => ({
-    software: [pi],
-    permissions: vmPermissions((c as unknown as { state: VmState }).state.egressAllowlist),
+  createState: (_c, input) => ({
+    egressAllowlist: input?.egressAllowlist ?? [],
+    hostRepoPath: input?.hostRepoPath ?? "",
   }),
+  resolveOptions: (c) => {
+    const state = (c as unknown as { state: VmState }).state;
+    return {
+      software: [pi],
+      permissions: vmPermissions(state.egressAllowlist),
+      // The repo lives on the host and is projected in. `readOnly` defaults to
+      // TRUE, so it must be set explicitly or the agent cannot edit anything.
+      mounts: state.hostRepoPath
+        ? [
+            {
+              path: WORKDIR,
+              plugin: createHostDirBackend({ hostPath: state.hostRepoPath, readOnly: false }),
+              readOnly: false,
+            },
+          ]
+        : [],
+    };
+  },
   actions: {
     /**
      * Teardown has to be initiated from inside the actor — agentOS exposes no

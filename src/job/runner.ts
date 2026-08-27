@@ -3,8 +3,14 @@ import type { SandboxProvider, Sandbox } from "../sandbox.ts";
 import { egressAllowlistFor, registriesForTestCmd } from "../sandbox.ts";
 import type { AgentSessionFactory } from "../agent/session.ts";
 import { buildSystemPrompt, buildUserPrompt, randomNonce } from "../agent/prompt.ts";
-import { shallowClone, WORKDIR, CloneError } from "../git/clone.ts";
-import { packageDiff, runTests, violatesDenylist, type TestRun } from "../artifact/package.ts";
+import { shallowClone, WORKDIR, CloneError, type Checkout } from "../git/clone.ts";
+import {
+  packageDiff,
+  runTests,
+  violatesDenylist,
+  requiredToolFor,
+  type TestRun,
+} from "../artifact/package.ts";
 import { makeRedactor } from "../events/redact.ts";
 import { truncateText, MAX_TOOL_RESULT_BYTES, type EventType } from "../events/schema.ts";
 
@@ -50,6 +56,7 @@ export async function runJob(
   const durations = { ...EMPTY_DURATIONS };
   let state: JobState = "queued";
   let sandbox: Sandbox | null = null;
+  let checkout: Checkout | null = null;
   let summary = "";
   let diff: string | null = null;
   let filesTouched: string[] = [];
@@ -102,31 +109,17 @@ export async function runJob(
   };
 
   try {
-    // 1. Provision, with egress narrowed to exactly what this job needs.
-    const gitHost = deps.gitHost ?? "github.com";
-    const llmHost = spec.llm_host ?? deps.llmHost ?? DEFAULT_LLM_HOST;
-    const egress = egressAllowlistFor({
-      gitHost,
-      llmHost,
-      registries: registriesForTestCmd(spec.constraints.test_cmd),
-    });
-    emit("phase", { state: "queued", egress });
-    sandbox = await deps.sandboxes.provision({
-      jobId: spec.job_id,
-      egressAllowlist: egress,
-      signal: controller.signal,
-    });
-
-    // 2. Clone at the pinned sha.
+    // 1. Clone FIRST, on the host. agentOS has no working git, so the tree is
+    //    cloned here and mounted into the VM — which also means the clone token
+    //    never enters the VM at all.
     setState("cloning");
-    const cloneStart = now();
     try {
-      await shallowClone(sandbox, {
+      checkout = await shallowClone({
         repo: spec.repo,
         baseRef: spec.base_ref,
         baseSha: spec.base_sha,
         cloneToken: spec.clone_token,
-        host: gitHost,
+        host: deps.gitHost ?? "github.com",
         signal: controller.signal,
       });
     } catch (err) {
@@ -134,8 +127,38 @@ export async function runJob(
       const detail = err instanceof CloneError ? `${err.message}: ${err.stderr}` : String(err);
       return finish("failed", { error: redactor.redactString(`clone failed — ${detail}`) });
     }
-    durations.clone_ms = now() - cloneStart;
+    durations.clone_ms = checkout.durationMs;
     emit("phase", { state: "cloning", done: true, duration_ms: durations.clone_ms });
+
+    // 2. Provision, with the checkout mounted and egress narrowed to exactly
+    //    what this job needs.
+    const llmHost = spec.llm_host ?? deps.llmHost ?? DEFAULT_LLM_HOST;
+    const egress = egressAllowlistFor({
+      llmHost,
+      registries: registriesForTestCmd(spec.constraints.test_cmd),
+    });
+    emit("phase", { state: "queued", egress });
+    sandbox = await deps.sandboxes.provision({
+      jobId: spec.job_id,
+      egressAllowlist: egress,
+      hostRepoPath: checkout.hostPath,
+      signal: controller.signal,
+    });
+
+    // The VM ships coreutils but no language runtimes. Fail here, plainly,
+    // rather than letting the caller read "tests failed" and go hunting.
+    if (spec.constraints.test_cmd) {
+      const tool = requiredToolFor(spec.constraints.test_cmd);
+      if (tool) {
+        const probe = await sandbox.exec("sh", ["-lc", `command -v ${tool}`]);
+        if (probe.exitCode !== 0)
+          return finish("failed", {
+            error:
+              `test_cmd requires \`${tool}\`, which is not available in the agentOS VM. ` +
+              `Set test_cmd to null and run tests in your CI instead.`,
+          });
+      }
+    }
 
     // 3. Agent session.
     setState("fixing");
@@ -179,7 +202,7 @@ export async function runJob(
 
     // 5. Package.
     setState("packaging");
-    const packaged = await packageDiff(sandbox, spec.base_sha, spec.constraints.max_diff_lines);
+    const packaged = await packageDiff(checkout.hostPath, spec.base_sha, spec.constraints.max_diff_lines);
     diff = packaged.diff || null;
     filesTouched = packaged.filesTouched;
 
@@ -205,8 +228,11 @@ export async function runJob(
     });
   } finally {
     clearTimeout(timer);
-    // 7. Dispose. Nothing persists in Ayos beyond actor state.
+    // 7. Dispose. Nothing persists in Ayos beyond actor state — the VM is
+    //    destroyed (idle sleep would keep its filesystem) and the host checkout,
+    //    which still holds the repo, is deleted.
     await sandbox?.dispose().catch(() => {});
+    await checkout?.cleanup().catch(() => {});
     void state;
   }
 }

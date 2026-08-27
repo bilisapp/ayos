@@ -84,11 +84,15 @@ CORS on the stream endpoint: allow the configured caller origin only.
 
 States: `queued → cloning → fixing → testing → packaging → done | failed | cancelled | timeout`.
 
-1. **Provision VM** (agentOS). Configure egress allowlist: the git host (clone), the agent's LLM host (or the gateway host), and the package registries `test_cmd` needs (e.g. `repo.packagist.org`, `registry.npmjs.org`). Nothing else. This is the prompt-injection blast-radius control.
-2. **Clone** shallow: `git clone --depth 50 --filter=blob:none --single-branch --branch {base_ref}`, then checkout `base_sha`. Credential delivered via one-shot `GIT_ASKPASS` script — never written to `.git/config` or shell history. Delete the askpass file after clone.
-3. **Agent session.** Start Pi via agentOS. Ayos's system prompt carries only the **safety invariants** (see Prompt safety); the caller's `task.instructions` carries the domain framing. Standing rules: minimal diff, run `test_cmd`, no new dependencies, never touch denylisted paths.
-4. **Verify.** Run `constraints.test_cmd` (if set); capture exit code + tail of output.
-5. **Package.** `git add -A && git diff --cached {base_sha}` → the patch. Collect a report: agent summary, files touched, test result, event count, durations, echoed `task.links`.
+1. **Provision VM** (agentOS), with the host checkout mounted. Configure egress allowlist: the agent's LLM host (or the gateway host) and the package registries `test_cmd` needs (e.g. `repo.packagist.org`, `registry.npmjs.org`). Nothing else — the git host is *not* on the list, since the clone already happened. This is the prompt-injection blast-radius control.
+
+   The allowlist is a deny-by-default `permissions.network` policy. Three details, all verified against a live VM and all easy to get wrong: `permissions` **replaces** the default policy object rather than merging into it, so every scope must be named explicitly or the agent's first `bash` call is denied; `operations` takes bare tokens (`http`, `fetch`), not the dotted names that appear in denial messages; and `patterns` match the full resource URI (`tcp://host:443`) as minimatch globs, not bare hostnames. A rule that matches nothing fails *closed*, but a rule that matches everything fails *open* — so each job probes a host that must be denied before the VM is trusted with credentials.
+2. **Clone** shallow, **on the host, before the VM boots**: `git clone --depth 50 --filter=blob:none --single-branch --branch {base_ref}`, then checkout `base_sha`. The checkout is mounted read-write into the VM at `/work/repo` (agentOS `host_dir` mount — note `readOnly` defaults to *true*). Credential delivered via one-shot `GIT_ASKPASS` script — never written to `.git/config` or shell history. Delete the askpass file after clone.
+
+   *Why host-side:* agentOS has no working git today. `@agentos-software/git` installs and registers (`/bin/git` exists, `which git` resolves) but every invocation fails with `exit 126, Permission denied`, while other wasm packages in the same VM work fine; its own npm description says "(planned)". Host-side cloning is also the better security position — **the clone token never enters the VM at all**, so a successful prompt injection cannot reach it. Revisit if agentOS ships working git.
+3. **Agent session.** Start Pi via agentOS. **Pi has no system-prompt channel**: its ACP adapter reads an append-system-prompt only from argv and its package manifest declares no `launchArgs`, so `additionalInstructions` never reaches the model (verified by capturing the outbound request). The safety invariants therefore ride at the head of the first user turn, labelled as operator rules. Pi's toolset (`read`, `bash`, `edit`, `write`) is fixed and not restrictable over ACP, and its `permissionPolicy` is inert because Pi never issues permission requests — so containment rests on the egress policy and on the fact that we only ever *propose* a diff. Ayos's system prompt carries only the **safety invariants** (see Prompt safety); the caller's `task.instructions` carries the domain framing. Standing rules: minimal diff, run `test_cmd`, no new dependencies, never touch denylisted paths.
+4. **Verify.** Run `constraints.test_cmd` (if set) in the VM against the mounted checkout; capture exit code + tail of output. The guest ships coreutils, grep, sed, gawk, findutils, tar and gzip — **no language runtimes**. If `test_cmd` needs one (php, node, python, …), the job fails immediately with an explicit message rather than reporting a confusing test failure: set `test_cmd: null` and let CI verify.
+5. **Package.** `git add -A && git diff --cached {base_sha}` on the host checkout → the patch. Collect a report: agent summary, files touched, test result, event count, durations, echoed `task.links`.
 6. **Callback.** POST the artifact to `callback_url` (HMAC-signed). Retry with backoff (3×); on final failure keep the artifact in actor state and expose `GET /jobs/:id/artifact` (HMAC) so the caller can pull.
 7. **Dispose** the VM. Nothing persists in Ayos beyond actor state (events + artifact), which can be GC'd after the caller acknowledges.
 
@@ -159,7 +163,7 @@ src/
   auth/hmac.ts        # sign/verify control-plane requests
   auth/streamJwt.ts   # Ed25519 verify for stream tokens
   events/{schema,ringBuffer,redact}.ts
-  git/clone.ts        # shallow clone + one-shot askpass
+  git/clone.ts        # host-side shallow clone + askpass; mounted into the VM
   artifact/{package,callback}.ts
 test/                 # vitest; HMAC/JWT, redaction, state machine, prompt framing
 ```
@@ -171,7 +175,7 @@ test/                 # vitest; HMAC/JWT, redaction, state machine, prompt frami
 3. **Real agent loop:** Pi session, prompt safety framing, test run, diff packaging, timeout/cancel.
 4. **Hardening:** egress allowlist, idempotency, 429 backpressure, retry/pull fallback for callbacks, healthz, deploy (Coolify/Traefik on an `agents.` subdomain, ideally on a separate box from the caller's production services).
 
-**Prototype risk to retire first (before milestone 3):** confirm the target project's `test_cmd` actually runs inside agentOS's POSIX-on-WASM environment (PHP + SQLite likely fine; anything needing real ClickHouse is not — such projects fall back to `test_cmd: null`, with tests running in CI on the caller's PR).
+**Prototype risk — retired, and it bit harder than expected.** agentOS is not POSIX-on-WASM in the way this assumed: it is a Rust userspace kernel running WASM-compiled binaries, with V8 for guest JS. The default guest software set is coreutils, diffutils, findutils, gawk, grep, gzip, sed and tar — **no PHP, node, python, git, curl or ssh**. So `test_cmd` for a typical project does not run in the VM at all, and PHP + SQLite is *not* fine. Such projects use `test_cmd: null` and verify in the caller's CI — the fallback this section already anticipated, now the common case rather than the exception.
 
 ## Explicit non-goals
 
