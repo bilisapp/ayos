@@ -75,6 +75,9 @@ export async function runJob(
 
   const onExternalAbort = () => abortFor("cancelled");
   externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
+  const deadline = now() + timeoutMs;
+  /** What is left of the job budget, as a hard per-command cap. Never zero. */
+  const remainingMs = () => Math.max(1_000, deadline - now());
   const timer = setTimeout(() => abortFor("timeout"), timeoutMs);
 
   const emit: EmitFn = (type, data, options) =>
@@ -114,9 +117,9 @@ export async function runJob(
   };
 
   try {
-    // 1. Clone FIRST, on the host. agentOS has no working git, so the tree is
-    //    cloned here and mounted into the VM — which also means the clone token
-    //    never enters the VM at all.
+    // 1. Clone FIRST, on the host. The VM's git cannot diff (see git/clone.ts),
+    //    so the tree is cloned here and mounted into the VM — which also means
+    //    the clone token never enters the VM at all.
     setState("cloning");
     try {
       checkout = await shallowClone({
@@ -155,7 +158,10 @@ export async function runJob(
     if (spec.constraints.test_cmd) {
       const tool = requiredToolFor(spec.constraints.test_cmd);
       if (tool) {
-        const probe = await sandbox.exec("sh", ["-lc", `command -v ${tool}`]);
+        const probe = await sandbox.exec("sh", ["-lc", `command -v ${tool}`], {
+          timeoutMs: Math.min(30_000, remainingMs()),
+          signal: controller.signal,
+        });
         if (probe.exitCode !== 0)
           return finish("failed", {
             error:
@@ -199,7 +205,13 @@ export async function runJob(
     // 4. Verify.
     if (spec.constraints.test_cmd) {
       setState("testing");
-      tests = await runTests(sandbox, spec.constraints.test_cmd, { signal: controller.signal });
+      // The job-level timer aborts the run, but an abort does not stop a
+      // process already running in the VM: the command needs its own cap, or a
+      // hanging test_cmd holds the VM and a concurrency slot indefinitely.
+      tests = await runTests(sandbox, spec.constraints.test_cmd, {
+        timeoutMs: remainingMs(),
+        signal: controller.signal,
+      });
       durations.test_ms = tests.durationMs;
       emit("test_output", { passed: tests.passed, output_tail: tests.output_tail });
       if (terminalReason) return finish(terminalReason);

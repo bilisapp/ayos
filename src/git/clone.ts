@@ -66,9 +66,12 @@ function stderrOf(err: unknown): string {
 }
 
 /**
- * Clones on the HOST, not in the VM: agentOS ships no working git today (the
- * git package registers but every invocation fails), so the clone happens here
- * and the tree is mounted into the VM.
+ * Clones on the HOST, not in the VM. agentOS's `@agentos-software/git` package
+ * does install a real `git` at /opt/agentos/bin/git, but it implements only a
+ * slice of git: `clone`, `checkout`, `commit` and `rev-parse` work, while
+ * `add`, `diff`, `status`, `ls-files` and `config` all exit 128 with
+ * `GitSubcommandUnsupported` (probed against 0.3.3). Packaging needs exactly
+ * the missing half, so the clone happens here and the tree is mounted in.
  *
  * This is also the better security position. The clone token never enters the
  * VM at all, so the agent cannot reach it even if the prompt fence fails —
@@ -161,13 +164,65 @@ export async function shallowClone(opts: CloneOptions): Promise<Checkout> {
   }
 }
 
-/** Runs a git command against a host checkout. Never throws on nonzero exit. */
+/**
+ * Puts `.git` back into a state the host can safely run git against.
+ *
+ * The `-c` overrides in `git()` beat repo config for every knob we can name,
+ * but not for a filter driver: `.gitattributes` says `*.php filter=x` and
+ * `.git/config` supplies `filter.x.clean = <command>`, which `git add -A` runs.
+ * We cannot enumerate the driver names, so the repo config goes instead —
+ * nothing in packaging needs a remote, and an undefined driver is a no-op, so a
+ * minimal config leaves the diff identical and the attack surface empty.
+ */
+export async function sanitizeGitDir(hostPath: string): Promise<void> {
+  const gitDir = join(hostPath, ".git");
+  await writeFile(
+    join(gitDir, "config"),
+    ["[core]", "\trepositoryformatversion = 0", "\tfilemode = true", "\tbare = false", ""].join(
+      "\n",
+    ),
+  );
+  await rm(join(gitDir, "config.worktree"), { force: true }).catch(() => {});
+  await rm(join(gitDir, "hooks"), { recursive: true, force: true }).catch(() => {});
+}
+
+/**
+ * Overrides every repo-local knob that turns a read-only-looking git command
+ * into command execution on the HOST.
+ *
+ * Once the VM has mounted the checkout, `.git` is agent-controlled: `.git/config`
+ * and `.gitattributes` are just files it can write. `diff.external`, a
+ * `diff.<driver>.command`/`textconv` pointed at by `.gitattributes`,
+ * `core.hooksPath`, `core.fsmonitor`, `core.pager` and `core.sshCommand` all name
+ * a program git will happily run for us during packaging. `-c` beats repo config,
+ * so these win regardless of what the agent wrote — the treat-`.git`-as-untrusted
+ * position, expressed as flags.
+ */
+const HARDENED_CONFIG = [
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.fsmonitor=false",
+  "-c", "core.pager=cat",
+  "-c", "core.sshCommand=false",
+  "-c", "core.askPass=",
+  "-c", "core.editor=false",
+  "-c", "core.attributesFile=/dev/null",
+  "-c", "core.excludesFile=/dev/null",
+  "-c", "credential.helper=",
+  "-c", "diff.external=",
+  "-c", "protocol.ext.allow=never",
+  "-c", "uploadpack.packObjectsHook=",
+];
+
+/**
+ * Runs a git command against a host checkout, ignoring machine config AND any
+ * config the agent may have planted in the checkout. Never throws on nonzero exit.
+ */
 export async function git(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string; ok: boolean }> {
   try {
-    const { stdout, stderr } = await run("git", args, {
+    const { stdout, stderr } = await run("git", [...HARDENED_CONFIG, ...args], {
       cwd,
       maxBuffer: 64 * 1024 * 1024,
       env: { ...process.env, ...isolatedGitConfig() },

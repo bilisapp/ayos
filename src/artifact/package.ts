@@ -1,4 +1,4 @@
-import { git } from "../git/clone.ts";
+import { git, sanitizeGitDir } from "../git/clone.ts";
 import { truncateText } from "../events/schema.ts";
 import type { Sandbox } from "../sandbox.ts";
 import { WORKDIR } from "../git/clone.ts";
@@ -22,15 +22,27 @@ export async function packageDiff(
   baseSha: string,
   maxDiffLines: number,
 ): Promise<DiffResult> {
+  // `.git` is agent-writable through the mount, so it is untrusted from here on.
+  await sanitizeGitDir(hostPath);
+
   await git(hostPath, ["add", "-A"]);
 
-  const names = await git(hostPath, ["diff", "--cached", "--name-only", baseSha]);
+  // --no-ext-diff/--no-textconv: belt and braces next to the hardened config in
+  // git(); a diff driver named by an agent-written .gitattributes must not run.
+  const names = await git(hostPath, [
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--cached",
+    "--name-only",
+    baseSha,
+  ]);
   const filesTouched = names.stdout
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const out = await git(hostPath, ["diff", "--cached", baseSha]);
+  const out = await git(hostPath, ["diff", "--no-ext-diff", "--no-textconv", "--cached", baseSha]);
   const diff = out.stdout;
   const lines = diff ? diff.split("\n") : [];
 

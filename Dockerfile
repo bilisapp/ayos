@@ -45,9 +45,9 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 FROM node:24-bookworm-slim AS runtime
 
-# git is a RUNTIME dependency: agentOS has no working git, so Ayos clones on the
-# host and mounts the checkout into the VM. Without git here, every job fails at
-# the first phase.
+# git is a RUNTIME dependency: agentOS's own git implements clone/checkout but
+# not add/diff (see SPEC), so Ayos clones AND diffs on the host and mounts the
+# checkout into the VM. Without git here, every job fails at the first phase.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*

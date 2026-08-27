@@ -33,12 +33,19 @@ is a no-op when no file is present.
 | `PORT` | `8080` (already the image default). |
 | `MAX_CONCURRENT_JOBS` | Start at `2–4` and raise once you've watched memory under load. |
 | `DEFAULT_TIMEOUT_S` | `900`. |
+| `MAX_BODY_BYTES` | `1048576` (default). Hard cap on a control-plane request body, applied *before* the signature is checked. |
+| `AYOS_HMAC_MODE` | `compat` (default) accepts both the legacy body-only signature and one bound to timestamp/method/path. Set `strict` once the caller signs bound. |
 
 There are deliberately **no LLM keys and no git credentials here** — both arrive per job, minted
 by the caller and short-lived. If you find yourself wanting to add one, something has gone wrong.
 
 Never set `AYOS_SKIP_EGRESS_CHECK` in production. It disables the per-job proof that the VM's
 network policy is actually enforced.
+
+A body-only signature is replayable across endpoints whenever the body is empty — a captured
+`GET /jobs/A/artifact` signature verifies just as well at `POST /jobs/B/cancel`. Bound signatures
+cover `timestamp.METHOD.path.body`. Ship `compat`, update the caller to sign the canonical string,
+then flip `AYOS_HMAC_MODE=strict` and the replay is gone.
 
 ## 3. Domain and TLS
 
@@ -118,5 +125,6 @@ The build compiles `isolated-vm`, `better-sqlite3` and `koffi` from source, whic
 shows up as the Docker daemon dying rather than as a readable error. If your Coolify host is small,
 build elsewhere and deploy the image, or give the builder more RAM.
 
-`git` is installed in the runtime image on purpose — agentOS has no working git, so Ayos clones on
-the host and mounts the checkout into the VM. Without it every job fails at the first phase.
+`git` is installed in the runtime image on purpose — agentOS's own git implements only
+clone/checkout, not `add`/`diff` (see SPEC), so Ayos clones and diffs on the host and mounts the
+checkout into the VM. Without it every job fails at the first phase.

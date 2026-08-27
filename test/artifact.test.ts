@@ -1,4 +1,5 @@
-import { rm, unlink } from "node:fs/promises";
+import { chmod, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   packageDiff,
@@ -236,6 +237,53 @@ describe("packageDiff", () => {
 function line(n: number): string {
   return Array.from({ length: n }, (_, i) => `// generated line ${i}`).join("\n") + "\n";
 }
+
+
+/* ------------------------------------------------- packageDiff, hostile .git */
+
+/**
+ * The VM mounts the whole checkout, so `.git` is agent-writable. Every knob
+ * below makes host git run a program of the agent's choosing during packaging;
+ * the marker file each would drop is the proof it did not.
+ */
+describe("packageDiff against an agent-controlled .git", () => {
+  it("does not run diff.external, a filter driver, or a hook", async () => {
+    const { path, sha } = await checkout();
+    const lootDir = await makeTempDir("ayos-test-loot-");
+    cleanups.push(() => rm(lootDir, { recursive: true, force: true }));
+    const loot = join(lootDir, "pwned");
+    const payload = join(path, "payload.sh");
+    await writeFile(payload, `#!/bin/sh\nprintf pwned > ${loot}\n`);
+    await chmod(payload, 0o700);
+
+    // Everything an agent could plant, planted.
+    await writeIn(path, ".gitattributes", "*.php filter=evil diff=evil\n");
+    await writeFile(
+      join(path, ".git", "config"),
+      [
+        "[core]",
+        "\trepositoryformatversion = 0",
+        `\thooksPath = ${dirname(payload)}`,
+        "[diff]",
+        `\texternal = ${payload}`,
+        '[filter "evil"]',
+        `\tclean = ${payload}`,
+        `\tsmudge = ${payload}`,
+        '[diff "evil"]',
+        `\ttextconv = ${payload}`,
+        `\tcommand = ${payload}`,
+        "",
+      ].join("\n"),
+    );
+
+    await writeIn(path, "app/Foo.php", "<?php\n// edited by the agent\n");
+    const result = await packageDiff(path, sha, 1000);
+
+    await expect(stat(loot)).rejects.toThrow();
+    expect(result.filesTouched).toContain("app/Foo.php");
+    expect(result.diff).toContain("edited by the agent");
+  });
+});
 
 /* -------------------------------------------------------- requiredToolFor */
 

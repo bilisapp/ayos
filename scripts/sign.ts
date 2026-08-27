@@ -6,6 +6,9 @@
  *   pnpm sign job.json --print         # just show the headers + curl
  *   pnpm sign --cancel <job_id>        # POST /jobs/:id/cancel
  *   pnpm sign --artifact <job_id>      # GET  /jobs/:id/artifact
+ *   pnpm sign job.json --bound         # sign timestamp.METHOD.path.body
+ *
+ * `--bound` is what a server running AYOS_HMAC_MODE=strict expects.
  */
 import { readFile } from "node:fs/promises";
 import { sign, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "../src/auth/hmac.ts";
@@ -19,6 +22,7 @@ if (!secret) {
 const base = process.env.AYOS_URL ?? "http://localhost:8080";
 const args = process.argv.slice(2);
 const printOnly = args.includes("--print");
+const bound = args.includes("--bound");
 
 let url: string;
 let method: "GET" | "POST";
@@ -46,7 +50,12 @@ if (cancelIdx !== -1) {
   method = "POST";
 }
 
-const headers = sign(secret, body);
+const headers = sign(
+  secret,
+  body,
+  undefined,
+  bound ? { method, path: new URL(url).pathname } : undefined,
+);
 
 console.log(`${method} ${url}`);
 console.log(`${SIGNATURE_HEADER}: ${headers[SIGNATURE_HEADER]}`);

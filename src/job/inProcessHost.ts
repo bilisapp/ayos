@@ -20,6 +20,8 @@ export interface InProcessHostDeps
   extends Pick<RunnerDeps, "sandboxes" | "agents" | "defaultTimeoutS"> {
   sharedSecret: string;
   ringCapacity?: number;
+  /** How long a finished job stays readable via GET /jobs/:id/artifact. */
+  retentionMs?: number;
   /** Injectable for tests; defaults to the real HMAC-signed POST. */
   deliver?: typeof deliverArtifact;
 }
@@ -29,8 +31,12 @@ export interface InProcessHostDeps
  * for what the Rivet actor must do — the actor swaps the Map for actor state
  * and the subscriber Set for actor connections.
  */
+/** One hour is comfortably longer than a caller's retry window for the pull path. */
+const DEFAULT_RETENTION_MS = 60 * 60 * 1000;
+
 export class InProcessJobHost implements JobHost {
   private readonly jobs = new Map<string, JobRecord>();
+  private readonly reapers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(private readonly deps: InProcessHostDeps) {}
 
@@ -95,7 +101,15 @@ export class InProcessJobHost implements JobHost {
     record.artifact = artifact;
 
     const deliver = this.deps.deliver ?? deliverArtifact;
-    const result = await deliver(record.spec.callback_url, artifact, this.deps.sharedSecret);
+    const callbackUrl = record.spec.callback_url;
+
+    // The job is over, so the credentials it carried have no further use here.
+    // Holding them costs nothing and buys an attacker a clone token and an LLM
+    // key out of a heap dump.
+    record.spec = { ...record.spec, clone_token: "", llm_key: "" };
+    this.scheduleReap(record.snapshot.job_id);
+
+    const result = await deliver(callbackUrl, artifact, this.deps.sharedSecret);
     if (!result.delivered) {
       // Keep it: the caller can pull from GET /jobs/:id/artifact.
       emit("error", {
@@ -104,6 +118,22 @@ export class InProcessJobHost implements JobHost {
         last_status: result.lastStatus,
       });
     }
+  }
+
+  /**
+   * Drops a finished job after its retention window. Without this the map is a
+   * leak: every job's spec, artifact and full event ring stays for the life of
+   * the process.
+   */
+  private scheduleReap(jobId: string): void {
+    const ms = this.deps.retentionMs ?? DEFAULT_RETENTION_MS;
+    const timer = setTimeout(() => {
+      this.reapers.delete(timer);
+      const record = this.jobs.get(jobId);
+      if (record && isTerminal(record.snapshot.state)) this.jobs.delete(jobId);
+    }, ms);
+    timer.unref?.();
+    this.reapers.add(timer);
   }
 
   async get(jobId: string): Promise<JobSnapshot | null> {
@@ -159,6 +189,9 @@ export class InProcessJobHost implements JobHost {
    * a tsx-watch restart hostage. On timeout the caller proceeds anyway.
    */
   async drain(timeoutMs: number): Promise<{ drained: boolean; pending: number }> {
+    for (const timer of this.reapers) clearTimeout(timer);
+    this.reapers.clear();
+
     const inFlight: Promise<void>[] = [];
     for (const record of this.jobs.values()) {
       if (isTerminal(record.snapshot.state)) continue;

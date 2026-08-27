@@ -64,7 +64,7 @@ dependency-note writer, with zero new code on this side of the HMAC.
 safety invariants ride at the head of the first user turn. The nonce fence around untrusted
 context still does the real separation work.
 
-**The VM has no git and no language runtimes.** The clone therefore happens on the host and is
+**The VM has only a partial git (clone/checkout, no `add`/`diff`) and no language runtimes.** The clone therefore happens on the host and is
 mounted in, which also keeps the clone token out of the VM. A `test_cmd` needing php, node or
 python fails the job with an explicit message; use `test_cmd: null` and verify in CI.
 

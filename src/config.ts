@@ -1,4 +1,5 @@
 import { loadPublicKey } from "./auth/streamJwt.ts";
+import { hmacModeFromEnv, type HmacMode } from "./auth/hmac.ts";
 import type { KeyLike } from "jose";
 
 export interface Config {
@@ -8,6 +9,9 @@ export interface Config {
   allowedOrigin: string;
   maxConcurrentJobs: number;
   defaultTimeoutS: number;
+  /** Hard cap on a control-plane request body, enforced before authentication. */
+  maxBodyBytes: number;
+  hmacMode: HmacMode;
 }
 
 function required(name: string): string {
@@ -35,5 +39,9 @@ export async function loadConfig(): Promise<Config> {
     allowedOrigin: process.env.ALLOWED_ORIGIN ?? "",
     maxConcurrentJobs: int("MAX_CONCURRENT_JOBS", 4),
     defaultTimeoutS: int("DEFAULT_TIMEOUT_S", 900),
+    // A job spec is a few KB. The limit exists because the body is read before
+    // the signature can be checked, so it is an unauthenticated allocation.
+    maxBodyBytes: int("MAX_BODY_BYTES", 1024 * 1024),
+    hmacMode: hmacModeFromEnv(),
   };
 }

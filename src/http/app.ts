@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { Config } from "../config.ts";
 import type { JobHost } from "../job/host.ts";
@@ -18,20 +18,60 @@ export function createApp({ config, host }: AppDeps): Hono {
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   /**
-   * Control-plane guard. Reads the RAW body — the signature covers bytes, not a
-   * re-serialized object — and hands the parsed JSON to the handler.
+   * Reads the body with a hard byte cap. The signature cannot be checked until
+   * the bytes are in hand, so this read is unauthenticated: without a cap an
+   * anonymous POST decides how much memory the process allocates. Content-Length
+   * is a hint (it can lie, or be absent under chunked encoding), so the stream
+   * is counted as it arrives too.
    */
-  const withHmac = async (c: { req: { text: () => Promise<string>; header: (n: string) => string | undefined } }) => {
-    const body = await c.req.text();
+  const readBody = async (req: Request, limit: number): Promise<string | null> => {
+    const declared = Number(req.headers.get("content-length") ?? NaN);
+    if (Number.isFinite(declared) && declared > limit) return null;
+    if (!req.body) return "";
+
+    const reader = req.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) {
+          await reader.cancel().catch(() => {});
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  };
+
+  /**
+   * Control-plane guard. Reads the RAW body — the signature covers bytes, not a
+   * re-serialized object — and binds the MAC to this request's method and path,
+   * so a captured empty-body signature cannot be replayed onto another job id
+   * or another endpoint. See `auth/hmac.ts` for the compat/strict modes.
+   */
+  const withHmac = async (c: Context) => {
+    const body = await readBody(c.req.raw, config.maxBodyBytes);
+    if (body === null) return { body: "", tooLarge: true as const, result: null };
+
     const result = verify(config.sharedSecret, body, {
       signature: c.req.header(SIGNATURE_HEADER),
       timestamp: c.req.header(TIMESTAMP_HEADER),
+    }, {
+      bind: { method: c.req.method, path: new URL(c.req.url).pathname },
+      mode: config.hmacMode,
     });
-    return { body, result };
+    return { body, tooLarge: false as const, result };
   };
 
   app.post("/jobs", async (c) => {
-    const { body, result } = await withHmac(c);
+    const { body, tooLarge, result } = await withHmac(c);
+    if (tooLarge) return c.json({ error: "payload too large" }, 413);
     if (!result.ok) return c.json({ error: "unauthorized", reason: result.reason }, 401);
 
     let json: unknown;
@@ -58,7 +98,8 @@ export function createApp({ config, host }: AppDeps): Hono {
   });
 
   app.post("/jobs/:id/cancel", async (c) => {
-    const { result } = await withHmac(c);
+    const { tooLarge, result } = await withHmac(c);
+    if (tooLarge) return c.json({ error: "payload too large" }, 413);
     if (!result.ok) return c.json({ error: "unauthorized", reason: result.reason }, 401);
 
     const cancelled = await host.cancel(c.req.param("id"));
@@ -67,7 +108,8 @@ export function createApp({ config, host }: AppDeps): Hono {
   });
 
   app.get("/jobs/:id/artifact", async (c) => {
-    const { result } = await withHmac(c);
+    const { tooLarge, result } = await withHmac(c);
+    if (tooLarge) return c.json({ error: "payload too large" }, 413);
     if (!result.ok) return c.json({ error: "unauthorized", reason: result.reason }, 401);
 
     const artifact = await host.artifact(c.req.param("id"));

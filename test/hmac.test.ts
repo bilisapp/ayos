@@ -4,6 +4,8 @@ import {
   verify,
   nowSeconds,
   SIGNATURE_HEADER,
+  canonicalString,
+  hmacModeFromEnv,
   TIMESTAMP_HEADER,
   SIGNATURE_PREFIX,
   TOLERANCE_SECONDS,
@@ -156,5 +158,48 @@ describe("verify", () => {
         timestamp: ` ${h[TIMESTAMP_HEADER]} `,
       }),
     ).toEqual({ ok: true });
+  });
+});
+
+describe("bound signatures", () => {
+  const BIND = { method: "GET", path: "/jobs/job-a/artifact" };
+
+  it("covers timestamp, method, path and body", () => {
+    expect(canonicalString("1700000000", "get", "/jobs/x", "{}")).toBe(
+      "1700000000.GET./jobs/x.{}",
+    );
+  });
+
+  it("verifies a bound signature", () => {
+    const h = sign(SECRET, BODY, ts(), BIND);
+    expect(verify(SECRET, BODY, headersOf(h), { bind: BIND, mode: "strict" })).toEqual({ ok: true });
+  });
+
+  it("rejects the same signature presented at another path or method", () => {
+    const h = sign(SECRET, "", ts(), BIND);
+    for (const bind of [
+      { method: "GET", path: "/jobs/job-b/artifact" },
+      { method: "POST", path: BIND.path },
+    ]) {
+      expect(verify(SECRET, "", headersOf(h), { bind, mode: "strict" })).toEqual({
+        ok: false,
+        reason: "signature mismatch",
+      });
+    }
+  });
+
+  it("compat accepts either scheme, strict only the bound one", () => {
+    const legacy = headersOf(sign(SECRET, BODY));
+    expect(verify(SECRET, BODY, legacy, { bind: BIND })).toEqual({ ok: true });
+    expect(verify(SECRET, BODY, legacy, { bind: BIND, mode: "strict" })).toEqual({
+      ok: false,
+      reason: "signature mismatch",
+    });
+  });
+
+  it("reads the mode from the environment, defaulting to compat", () => {
+    expect(hmacModeFromEnv({} as NodeJS.ProcessEnv)).toBe("compat");
+    expect(hmacModeFromEnv({ AYOS_HMAC_MODE: "compat" } as NodeJS.ProcessEnv)).toBe("compat");
+    expect(hmacModeFromEnv({ AYOS_HMAC_MODE: "strict" } as NodeJS.ProcessEnv)).toBe("strict");
   });
 });

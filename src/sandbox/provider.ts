@@ -8,7 +8,6 @@ export function createSandboxProvider(): SandboxProvider {
     client,
     // Set AYOS_SKIP_EGRESS_CHECK=1 only for local work against a VM you trust;
     // in production a silently-unenforced allowlist must fail the job.
-    // verifyEgress: process.env.AYOS_SKIP_EGRESS_CHECK !== "1",
-    verifyEgress: false
+    verifyEgress: process.env.AYOS_SKIP_EGRESS_CHECK !== "1",
   });
 }

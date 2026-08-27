@@ -21,6 +21,8 @@ STREAM_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----
 ALLOWED_ORIGIN=http://localhost                 # your Laravel app's origin
 MAX_CONCURRENT_JOBS=4
 DEFAULT_TIMEOUT_S=900
+MAX_BODY_BYTES=1048576
+AYOS_HMAC_MODE=compat
 ```
 
 No LLM key and no git credentials here — those arrive per job.

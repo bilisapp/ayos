@@ -71,6 +71,20 @@ export interface AgentOsClient {
   };
 }
 
+/** Ceiling for any command with no explicit cap of its own. */
+export const DEFAULT_EXEC_TIMEOUT_MS = 10 * 60 * 1000;
+
+const ABORTED = Symbol("aborted");
+
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 /** A Sandbox backed by one agentOS VM actor, plus the live event connection. */
 export class AgentOsSandbox implements Sandbox {
   private disposed = false;
@@ -84,12 +98,21 @@ export class AgentOsSandbox implements Sandbox {
   async exec(cmd: string, args: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     // `output.capture` defaults to "none", which returns a result with no
     // stdout/stderr fields at all. Everything we run here is run for its output.
-    const res = await this.vm.process.execFile(cmd, args, {
+    const call = this.vm.process.execFile(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      timeoutMs: opts.timeoutMs,
+      // Never uncapped: execFile without a timeout waits forever, so a hung
+      // command would pin the job and its VM until the process is restarted.
+      timeoutMs: opts.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS,
       output: { capture: "all" },
     });
+
+    // The guest owns the timeout, but a cancel must not leave us awaiting it.
+    // The VM is destroyed on dispose, so abandoning the call is safe: stopping
+    // the wait is the whole point.
+    const res = opts.signal ? await raceAbort(call, opts.signal) : await call;
+    if (res === ABORTED)
+      return { exitCode: 124, stdout: "", stderr: "aborted" };
 
     // A nonzero exit does not throw, and a timeout comes back as an outcome
     // rather than an exception. Missing exitCode means the process reported

@@ -18,3 +18,12 @@ supportedArchitectures:
   libc:
     - current
     - musl
+
+# Transitive prod deps with published advisories that the parent packages have
+# not picked up yet. Each is a patch-level bump within the range its parent
+# already asks for, so nothing here changes an API we depend on.
+#   drizzle-orm  GHSA — SQL injection via unescaped identifiers
+#   uuid         GHSA — missing buffer bounds check in v3/v5/v6
+overrides:
+  drizzle-orm@<0.45.2: '>=0.45.2'
+  uuid@<11.1.1: '>=11.1.1'

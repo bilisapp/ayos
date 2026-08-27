@@ -1,5 +1,7 @@
 import { agentOS, setup, createHostDirBackend } from "@rivet-dev/agentos";
 import pi from "@agentos-software/pi";
+import ripgrep from "@agentos-software/ripgrep";
+import jq from "@agentos-software/jq";
 import { vmPermissions } from "../sandbox/permissions.ts";
 import { WORKDIR } from "../git/clone.ts";
 
@@ -29,7 +31,20 @@ export const vm = agentOS<VmState, undefined, undefined, undefined, VmInput>({
   resolveOptions: (c) => {
     const state = (c as unknown as { state: VmState }).state;
     return {
-      software: [pi],
+      // `pi` is the agent itself; `rg` and `jq` are not in the guest's base set.
+      //
+      // Verified in a live VM, because none of this is documented: a `software`
+      // command runs when the actor execs it directly (`process.execFile("rg",
+      // …)` works), but NOT from inside a shell — `sh -lc 'rg …'` fails with
+      // `exit 126, Permission denied (os error 2)` even given the absolute
+      // path, while base-set commands like `sed` run fine there. So these help
+      // anything Ayos execs itself; whether the agent can reach them depends on
+      // how pi spawns its tools.
+      //
+      // Two more surprises worth knowing: `rg` needs an ABSOLUTE path (`rg x .`
+      // fails with os error 44 on the mount), and it does not honour the repo's
+      // .gitignore, so it will happily walk vendor/.
+      software: [pi, ripgrep, jq],
       permissions: vmPermissions(state.egressAllowlist),
       // The repo lives on the host and is projected in. `readOnly` defaults to
       // TRUE, so it must be set explicitly or the agent cannot edit anything.
