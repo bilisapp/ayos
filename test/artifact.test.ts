@@ -1,10 +1,36 @@
-import { describe, expect, it, vi } from "vitest";
-import { packageDiff, runTests, violatesDenylist } from "../src/artifact/package.ts";
+import { rm, unlink } from "node:fs/promises";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  packageDiff,
+  requiredToolFor,
+  runTests,
+  violatesDenylist,
+} from "../src/artifact/package.ts";
 import { deliverArtifact } from "../src/artifact/callback.ts";
 import { SIGNATURE_HEADER, TIMESTAMP_HEADER, verify } from "../src/auth/hmac.ts";
 import { WORKDIR } from "../src/git/clone.ts";
 import type { Artifact } from "../src/types.ts";
 import { FakeSandbox } from "./helpers/fakeSandbox.ts";
+import { commitAll, git, installGitConfig, makeTempDir, seedRepo, writeIn } from "./helpers/tempRepo.ts";
+
+/**
+ * `packageDiff` runs real git against a host checkout now, so these fixtures are
+ * real repositories under the OS temp dir. The developer's own ~/.gitconfig is
+ * neutralised: a global `core.excludesFile` would silently stop `git add -A`
+ * staging a fixture file and make these tests lie.
+ */
+let configDir: string;
+let restoreGitConfig: () => void;
+
+beforeAll(async () => {
+  configDir = await makeTempDir("ayos-test-gitconfig-");
+  restoreGitConfig = await installGitConfig(configDir, "");
+});
+
+afterAll(async () => {
+  restoreGitConfig?.();
+  await rm(configDir, { recursive: true, force: true });
+});
 
 /* ------------------------------------------------------------------ denylist */
 
@@ -89,64 +115,174 @@ describe("violatesDenylist", () => {
 
 /* --------------------------------------------------------------- packageDiff */
 
-const DIFF_HEADER = "diff --git a/app/Foo.php b/app/Foo.php";
+const SEED = {
+  "app/Foo.php": "<?php\n// original\n",
+  "app/Gone.php": "<?php\n// doomed\n",
+  "README.md": "readme\n",
+};
+
+/** A checkout pinned at `sha`, cleaned up when the test ends. */
+async function checkout(): Promise<{ path: string; sha: string }> {
+  const repo = await seedRepo(SEED);
+  cleanups.push(repo.cleanup);
+  return { path: repo.path, sha: repo.sha };
+}
+
+const cleanups: (() => Promise<void>)[] = [];
+afterAll(async () => {
+  await Promise.all(cleanups.map((c) => c()));
+});
 
 describe("packageDiff", () => {
-  function sandboxWith(names: string, diff: string) {
-    return new FakeSandbox((call) => {
-      if (call.args[0] === "add") return { exitCode: 0 };
-      if (call.args.includes("--name-only")) return { stdout: names };
-      if (call.args[0] === "diff") return { stdout: diff };
-      return {};
-    });
-  }
+  it("reports added, modified and deleted files against the pinned base", async () => {
+    const { path, sha } = await checkout();
 
-  it("stages everything then diffs against the pinned base sha in the workdir", async () => {
-    const sb = sandboxWith("app/Foo.php\n", `${DIFF_HEADER}\n+x\n`);
-    await packageDiff(sb, "abc1234", 800);
+    await writeIn(path, "app/Foo.php", "<?php\n// edited by the agent\n");
+    await writeIn(path, "app/New.php", "<?php\n// brand new, untracked\n");
+    await unlink(`${path}/app/Gone.php`);
 
-    expect(sb.execCalls.map((c) => [c.cmd, ...c.args])).toEqual([
-      ["git", "add", "-A"],
-      ["git", "diff", "--cached", "--name-only", "abc1234"],
-      ["git", "diff", "--cached", "abc1234"],
-    ]);
-    for (const call of sb.execCalls) expect(call.opts?.cwd).toBe(WORKDIR);
+    const res = await packageDiff(path, sha, 800);
+
+    // The untracked file is the whole reason `packageDiff` stages first.
+    expect([...res.filesTouched].sort()).toEqual(["app/Foo.php", "app/Gone.php", "app/New.php"]);
+    expect(res.filesTouched).not.toContain("README.md");
+
+    expect(res.diff).toContain("diff --git a/app/New.php b/app/New.php");
+    expect(res.diff).toContain("new file mode");
+    expect(res.diff).toContain("brand new, untracked");
+    expect(res.diff).toContain("diff --git a/app/Gone.php b/app/Gone.php");
+    expect(res.diff).toContain("deleted file mode");
+    expect(res.diff).toContain("+// edited by the agent");
+    expect(res.diff).toContain("-// original");
+
+    expect(res.truncated).toBe(false);
+    expect(res.lineCount).toBe(res.diff.split("\n").length);
   });
 
-  it("parses files_touched, trimming and dropping blank lines", async () => {
-    const sb = sandboxWith("app/Foo.php\n  app/Bar.php  \n\n", `${DIFF_HEADER}\n`);
-    const res = await packageDiff(sb, "abc1234", 800);
-    expect(res.filesTouched).toEqual(["app/Foo.php", "app/Bar.php"]);
+  it("picks up a new file the agent never told git about", async () => {
+    const { path, sha } = await checkout();
+    await writeIn(path, "app/Only.php", "<?php\n// untracked\n");
+
+    const res = await packageDiff(path, sha, 800);
+    expect(res.filesTouched).toEqual(["app/Only.php"]);
+    expect(res.diff).toContain("new file mode");
+  });
+
+  it("never commits — the caller owns the write path", async () => {
+    const { path, sha } = await checkout();
+    await writeIn(path, "app/Foo.php", "<?php\n// edited\n");
+    await packageDiff(path, sha, 800);
+    expect(await git(path, "rev-parse", "HEAD")).toBe(sha);
+  });
+
+  it("diffs against base_sha, not HEAD — a commit the agent made still shows up", async () => {
+    const { path, sha } = await checkout();
+
+    await writeIn(path, "app/Foo.php", "<?php\n// committed by the agent\n");
+    const later = await commitAll(path, "agent commit");
+    expect(later).not.toBe(sha);
+    await writeIn(path, "app/Bar.php", "<?php\n// and then this\n");
+
+    const res = await packageDiff(path, sha, 800);
+    expect([...res.filesTouched].sort()).toEqual(["app/Bar.php", "app/Foo.php"]);
+    expect(res.diff).toContain("committed by the agent");
+    expect(res.diff).toContain("and then this");
+
+    // Sanity: against HEAD the committed change would have been invisible.
+    const vsHead = await packageDiff(path, later, 800);
+    expect(vsHead.filesTouched).toEqual(["app/Bar.php"]);
   });
 
   it("returns an empty diff untouched (agent made no change)", async () => {
-    const sb = sandboxWith("", "");
-    const res = await packageDiff(sb, "abc1234", 800);
+    const { path, sha } = await checkout();
+    const res = await packageDiff(path, sha, 800);
     expect(res).toEqual({ diff: "", filesTouched: [], lineCount: 0, truncated: false });
   });
 
   it("does not truncate a diff at exactly the limit", async () => {
-    const diff = Array.from({ length: 10 }, (_, i) => `+line ${i}`).join("\n");
-    const sb = sandboxWith("app/Foo.php\n", diff);
-    const res = await packageDiff(sb, "abc1234", 10);
-    expect(res.truncated).toBe(false);
-    expect(res.diff).toBe(diff);
-    expect(res.lineCount).toBe(10);
+    const { path, sha } = await checkout();
+    await writeIn(path, "app/Foo.php", `<?php\n${line(30)}`);
+
+    const full = await packageDiff(path, sha, 10_000);
+    expect(full.truncated).toBe(false);
+
+    const atLimit = await packageDiff(path, sha, full.lineCount);
+    expect(atLimit.truncated).toBe(false);
+    expect(atLimit.diff).toBe(full.diff);
+    expect(atLimit.lineCount).toBe(full.lineCount);
   });
 
   it("truncates a diff over max_diff_lines and reports the real line count", async () => {
-    const diff = Array.from({ length: 50 }, (_, i) => `+line ${i}`).join("\n");
-    const sb = sandboxWith("app/Foo.php\n", diff);
-    const res = await packageDiff(sb, "abc1234", 10);
+    const { path, sha } = await checkout();
+    // Comfortably more added lines than the limit below.
+    await writeIn(path, "app/Foo.php", `<?php\n${line(200)}`);
 
+    const full = await packageDiff(path, sha, 10_000);
+    expect(full.lineCount).toBeGreaterThan(10);
+
+    const res = await packageDiff(path, sha, 10);
     expect(res.truncated).toBe(true);
-    expect(res.lineCount).toBe(50);
+    expect(res.lineCount).toBe(full.lineCount);
+
     const lines = res.diff.split("\n");
-    expect(lines.slice(0, 10)).toEqual(diff.split("\n").slice(0, 10));
-    expect(lines.at(-1)).toBe("...[diff truncated at 10 lines; 50 total]");
-    expect(res.diff).not.toContain("+line 10");
+    expect(lines.slice(0, 10)).toEqual(full.diff.split("\n").slice(0, 10));
+    expect(lines.at(-1)).toBe(`...[diff truncated at 10 lines; ${full.lineCount} total]`);
+    expect(res.diff).not.toContain("// generated line 199");
     // files_touched survives truncation — the caller still knows the blast radius
     expect(res.filesTouched).toEqual(["app/Foo.php"]);
+  });
+});
+
+function line(n: number): string {
+  return Array.from({ length: n }, (_, i) => `// generated line ${i}`).join("\n") + "\n";
+}
+
+/* -------------------------------------------------------- requiredToolFor */
+
+describe("requiredToolFor", () => {
+  it.each([
+    ["php artisan test", "php"],
+    ["php artisan test --compact", "php"],
+    ["npm test", "npm"],
+    ["npm run test -- --ci", "npm"],
+    ["pnpm test", "pnpm"],
+    ["yarn test", "yarn"],
+    ["npx vitest run", "npx"],
+    ["node --test", "node"],
+    ["pytest -q", "pytest"],
+    ["python3 -m pytest", "python3"],
+    ["bundle exec rspec", "bundle"],
+    ["go test ./...", "go"],
+    ["cargo test", "cargo"],
+    ["composer test", "composer"],
+    ["dotnet test", "dotnet"],
+  ])("%s needs %s", (cmd, tool) => {
+    expect(requiredToolFor(cmd)).toBe(tool);
+  });
+
+  it("resolves an absolute path down to its binary name", () => {
+    expect(requiredToolFor("/usr/local/bin/php foo.php")).toBe("php");
+    expect(requiredToolFor("/opt/homebrew/bin/pytest -q")).toBe("pytest");
+  });
+
+  it("tolerates leading whitespace", () => {
+    expect(requiredToolFor("   php artisan test")).toBe("php");
+  });
+
+  // The null cases gate the preflight: a false positive here fails a job that
+  // would have run fine in the guest.
+  it.each([
+    "sh -c 'echo hi'",
+    "true",
+    "make test",
+    "./vendor/bin/phpunit",
+    "bash run-tests.sh",
+    "/bin/echo hello",
+    "ls -la",
+    "",
+    "   ",
+  ])("%j needs nothing preinstalled", (cmd) => {
+    expect(requiredToolFor(cmd)).toBeNull();
   });
 });
 
@@ -201,6 +337,7 @@ describe("runTests", () => {
 /* ----------------------------------------------------------- deliverArtifact */
 
 const SECRET = "shared-secret-for-the-callback";
+const DIFF_HEADER = "diff --git a/app/Foo.php b/app/Foo.php";
 
 function artifact(): Artifact {
   return {

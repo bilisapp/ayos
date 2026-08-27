@@ -9,29 +9,20 @@ export interface ExecCall {
 /** Return a partial result to override the default `exitCode: 0` empty result. */
 export type ExecHandler = (call: ExecCall, index: number) => Partial<ExecResult> | void;
 
-export interface WrittenFile {
-  path: string;
-  contents: string;
-  mode: number | undefined;
-}
-
 /**
- * In-memory Sandbox. Records everything so tests can assert on argv, env, and
- * the file lifecycle without booting a VM.
+ * In-memory Sandbox. Records every exec so tests can assert on argv, cwd and
+ * options without booting a VM.
+ *
+ * This is much smaller than it used to be: the clone and the diff now run on
+ * the host against a real checkout, so `runTests` is the only thing left that
+ * genuinely goes through the VM.
  */
 export class FakeSandbox implements Sandbox {
   readonly execCalls: ExecCall[] = [];
-  readonly writes: WrittenFile[] = [];
-  readonly removed: string[] = [];
   readonly files = new Map<string, string>();
   disposeCount = 0;
-  removeShouldThrow = false;
 
   constructor(private handler: ExecHandler = () => undefined) {}
-
-  setHandler(handler: ExecHandler): void {
-    this.handler = handler;
-  }
 
   async exec(cmd: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     const call: ExecCall = { cmd, args, opts };
@@ -41,8 +32,7 @@ export class FakeSandbox implements Sandbox {
     return { exitCode: 0, stdout: "", stderr: "", ...override };
   }
 
-  async writeFile(path: string, contents: string, opts?: { mode?: number }): Promise<void> {
-    this.writes.push({ path, contents, mode: opts?.mode });
+  async writeFile(path: string, contents: string): Promise<void> {
     this.files.set(path, contents);
   }
 
@@ -53,26 +43,10 @@ export class FakeSandbox implements Sandbox {
   }
 
   async remove(path: string): Promise<void> {
-    if (this.removeShouldThrow) throw new Error(`EACCES: ${path}`);
-    this.removed.push(path);
     this.files.delete(path);
   }
 
   async dispose(): Promise<void> {
     this.disposeCount++;
-  }
-
-  /** Every exec as `cmd arg arg …`, for leak assertions. */
-  commandLines(): string[] {
-    return this.execCalls.map((c) => [c.cmd, ...c.args].join(" "));
-  }
-
-  /** Everything the sandbox ever saw as argv (NOT env) — where a token must never appear. */
-  argvText(): string {
-    return JSON.stringify(this.execCalls.map((c) => [c.cmd, ...c.args]));
-  }
-
-  envs(): Record<string, string>[] {
-    return this.execCalls.map((c) => c.opts?.env ?? {});
   }
 }

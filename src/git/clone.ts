@@ -6,6 +6,29 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 
+/**
+ * Ignores the machine's own git configuration.
+ *
+ * `GIT_CONFIG_NOSYSTEM` alone is not enough — it leaves `~/.gitconfig` in play,
+ * and a developer or CI box very often has settings there that change what a
+ * credential-bearing clone does. The one that bites hardest is
+ * `url."git@github.com:".insteadOf = https://github.com/`, which silently
+ * rewrites our HTTPS clone to SSH: the askpass token path is then never used and
+ * the clone either fails or succeeds via some unrelated key on the host. A
+ * global `credential.helper`, `core.hooksPath` or `http.*` is the same class of
+ * problem, and `core.excludesFile` can quietly drop an agent-added file from
+ * `git add -A`, and therefore from the diff we ship.
+ *
+ * An explicit GIT_CONFIG_GLOBAL in the environment still wins, which is what
+ * lets the tests point a fake origin at a local path.
+ */
+function isolatedGitConfig(): Record<string, string> {
+  return {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL ?? "/dev/null",
+  };
+}
+
 /** Where the host clone is mounted inside the VM. */
 export const WORKDIR = "/work/repo";
 
@@ -86,7 +109,7 @@ export async function shallowClone(opts: CloneOptions): Promise<Checkout> {
     GIT_ASKPASS: askpassPath,
     AYOS_GIT_TOKEN: opts.cloneToken,
     GIT_TERMINAL_PROMPT: "0",
-    GIT_CONFIG_NOSYSTEM: "1",
+    ...isolatedGitConfig(),
   };
   const gitOpts = { env, signal: opts.signal, maxBuffer: 16 * 1024 * 1024 };
 
@@ -147,7 +170,7 @@ export async function git(
     const { stdout, stderr } = await run("git", args, {
       cwd,
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" },
+      env: { ...process.env, ...isolatedGitConfig() },
     });
     return { stdout, stderr, ok: true };
   } catch (err) {

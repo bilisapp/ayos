@@ -58,6 +58,15 @@ export const vm = agentOS<VmState, undefined, undefined, undefined, VmInput>({
   },
 });
 
-export const registry = setup({ use: { vm } });
+/**
+ * `startEngine: false` when AYOS_EXTERNAL_ENGINE=1 — rivetkit 2.3.9's own engine
+ * boot fails its health check on macOS arm64 (the engine binds and finishes
+ * backfills well after rivetkit gives up), so local dev runs the engine as a
+ * separate process. See `pnpm engine` and the README.
+ */
+export const registry = setup({
+  use: { vm },
+  ...(process.env.AYOS_EXTERNAL_ENGINE === "1" ? { startEngine: false } : {}),
+});
 
 export type VmRegistry = typeof registry;

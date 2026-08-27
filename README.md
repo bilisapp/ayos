@@ -10,10 +10,14 @@ See [SPEC.md](./SPEC.md) for the full design. This README covers what exists and
 
 ```sh
 pnpm install
-cp .env.example .env    # set AYOS_SHARED_SECRET at minimum
-pnpm test               # unit suite (no VM required)
-pnpm dev
+pnpm keygen             # prints .env blocks for Ayos and for the caller
+pnpm test               # unit suite, no VM required
+pnpm dev                # rivet engine + ayos on :8080
 ```
+
+**[RUNNING.md](./RUNNING.md)** has the full local-dev walkthrough, including wiring a Laravel
+caller: signing requests, verifying the artifact callback, minting stream tokens, and a
+full-circle checklist.
 
 ## Layout
 
