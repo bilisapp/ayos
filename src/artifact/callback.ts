@@ -1,4 +1,5 @@
-import { sign } from "../auth/hmac.ts";
+import type { KeyObject } from "node:crypto";
+import { signRequest } from "../auth/sign.ts";
 import type { Artifact } from "../types.ts";
 
 export interface CallbackResult {
@@ -11,19 +12,24 @@ export interface CallbackResult {
 const DEFAULT_BACKOFF_MS = [1000, 4000, 10_000];
 
 /**
- * Deliver the artifact, HMAC-signed with the same secret the caller used to
- * dispatch. On final failure the actor keeps the artifact so the caller can
- * pull it from GET /jobs/:id/artifact.
+ * Deliver the artifact, signed with this run's Ed25519 key.
+ *
+ * This is the only thing the caller is actually waiting for, and the run has
+ * nowhere to keep it: there is no `GET /jobs/:id/artifact` any more, because
+ * there is no server. So the retries here are the first line, and the caller
+ * reconciling a finished-but-silent run against the platform's run status is
+ * the second. Between them, a job never disappears quietly.
  */
 export async function deliverArtifact(
   url: string,
   artifact: Artifact,
-  secret: string,
+  key: KeyObject,
   opts: {
     attempts?: number;
     backoffMs?: readonly number[];
     fetchImpl?: typeof fetch;
     sleep?: (ms: number) => Promise<void>;
+    requestTimeoutMs?: number;
   } = {},
 ): Promise<CallbackResult> {
   const maxAttempts = opts.attempts ?? 3;
@@ -37,10 +43,14 @@ export async function deliverArtifact(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      // Signed per attempt, not once: the timestamp is inside the signature and
+      // the caller enforces a freshness window, so a signature minted before a
+      // ten-second backoff has to be minted again after it.
       const res = await doFetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json", ...sign(secret, body) },
+        headers: { "content-type": "application/json", ...signRequest(key, body) },
         body,
+        signal: AbortSignal.timeout(opts.requestTimeoutMs ?? 30_000),
       });
       lastStatus = res.status;
       if (res.ok) return { delivered: true, attempts: attempt, lastStatus };

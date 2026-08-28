@@ -9,4 +9,7 @@ dist
 !.env.example
 *.log
 test
-.rivet
+examples
+vitest.config.ts
+ayos.png
+*.md

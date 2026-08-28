@@ -4,79 +4,88 @@
 
 # ayos
 
-Single-purpose execution service: it takes a signed job spec, runs a coding agent against a
-repository inside an isolated VM, and returns a diff plus a structured report. It never pushes
-to a git remote — the caller owns the write path.
+Single-purpose execution service: it takes a job spec, runs a coding agent against a repository,
+and returns a diff plus a structured report. It never pushes to a git remote — the caller owns
+the write path.
+
+One job is one container run. There is no server, no port and nothing listening.
 
 ## Quick start
 
 ```sh
 pnpm install
-pnpm keygen             # prints .env blocks for Ayos and for the caller
-pnpm test               # unit suite, no VM required
-pnpm dev                # rivet engine + ayos on :8080
+pnpm test                    # 244 tests, no network, no container
+pnpm keygen                  # an Ed25519 keypair, for local runs
+pnpm run:local ./job.json    # run one job exactly as the container does
 ```
 
 ## How a job runs
 
 ```
-POST /jobs (HMAC-signed spec)
-  → clone on the host, mount into a fresh agentOS VM
-  → agent session (Pi) works inside the VM, events stream over SSE
+start a run, spec in the environment
+  → clone at base_sha, then REVOKE the clone token
+  → Pi (SDK, in-process) works in the checkout, event batches POST to the caller
   → optional test_cmd, diff packaged, denylist enforced
-  → signed artifact callback to the caller; VM destroyed
+  → signed artifact POSTed to the caller; the container exits
 ```
 
-The browser can watch a job live at `GET /jobs/:id/stream` with an Ed25519 token the caller
-mints (`{ sub, job, scope: "stream:read", exp }`). Ayos holds only the public key. Everything
-else (`/jobs`, `/jobs/:id/cancel`, `/jobs/:id/artifact`) is server-to-server, HMAC-signed:
-`HMAC-SHA256(secret, rawBody)` over the raw body only, with the timestamp riding beside it as
-`X-Ayos-Timestamp` inside a ±5 minute window.
+The caller starts the run through its platform's API and mints an Ed25519 keypair for it: the
+private half goes into the run, the public half stays on the caller's job record. Everything the
+run posts back is signed with it. There is no shared secret and no inbound authentication,
+because there is nothing to authenticate *to*.
 
 ## Reusing it
 
-Ayos was built to power an autofix pipeline, but nothing in it knows what an autofix is. The
-job spec is `instructions + repo in, diff + report out`, and that is the whole integration
-surface. There is no SDK and no shared queue: a caller is one signed POST and one webhook
-handler, in any language that has HMAC.
+Ayos was built to power an autofix pipeline, but nothing in it knows what an autofix is. The job
+spec is `instructions + repo in, diff + report out`, and that is the whole integration surface.
+There is no SDK and no shared queue: a caller is one API call to start a run and one webhook
+handler, in any language that can verify an Ed25519 signature.
 
-[`examples/translate-readme.mjs`](./examples/translate-readme.mjs) is a complete caller in under
-a hundred dependency-free lines. It asks the agent for a Spanish translation of a repo's README
-and leaves the diff on disk for `git apply`. A task with nothing bug-shaped about it, driven
-through the same four endpoints Bilis uses:
+[`examples/translate-readme.mjs`](./examples/translate-readme.mjs) is a complete caller in under a
+hundred dependency-free lines. It asks the agent for a Spanish translation of a repo's README and
+leaves the diff on disk for `git apply` — a task with nothing bug-shaped about it, driven through
+the same contract Bilis uses:
 
 ```sh
-AYOS_URL=http://localhost:8080 AYOS_SHARED_SECRET=... \
 GITHUB_TOKEN=... ANTHROPIC_API_KEY=... \
 node examples/translate-readme.mjs org/repo main <base-sha>
 ```
 
-The simplicity is the safety model. Because the artifact is only ever a diff, the blast radius
-of a misbehaving agent is capped at "a patch you haven't applied": Ayos holds no write
-credentials, pushes nothing, and forgets the VM when the job ends. Every policy question (who
-may run jobs, what gets published where, when to retry) stays in the caller. Swap the
-instructions and the same executor becomes a codemod runner, a docs bot, or a nightly
-dependency-note writer, with zero new code on this side of the HMAC.
+The simplicity is the safety model. Because the artifact is only ever a diff, the blast radius of
+a misbehaving agent is capped at "a patch you haven't applied": Ayos holds no write credentials,
+pushes nothing, and the container is gone when the job ends. Every policy question (who may run
+jobs, what gets published where, when to retry) stays in the caller.
 
-## Two constraints
+## Three things worth knowing
 
-**Pi has no system-prompt channel.** `additionalInstructions` never reaches the model, so Ayos's
-safety invariants ride at the head of the first user turn. The nonce fence around untrusted
-context still does the real separation work.
+**The clone token is single-use.** It enters the same container as the agent, so it is revoked the
+moment the clone finishes — before the agent's first tool call. A caller that caches installation
+tokens across jobs must stop doing that for the token it hands to Ayos.
 
-**The VM has only a partial git (clone/checkout, no `add`/`diff`) and no language runtimes.** The clone therefore happens on the host and is
-mounted in, which also keeps the clone token out of the VM. A `test_cmd` needing php, node or
-python fails the job with an explicit message; use `test_cmd: null` and verify in CI.
+**The repository does not get to write the system prompt.** Pi normally discovers `AGENTS.md`,
+`.pi/skills/*` and extensions from the working directory. The working directory here is untrusted
+input, so all of that discovery is turned off. There is a test that plants a hostile `AGENTS.md`
+and asserts it never reaches the model.
+
+**There is no egress control.** agentOS gave each job a deny-by-default network policy; a
+serverless container has no equivalent, and a proxy is defeated by the agent having `bash`. So a
+prompt-injected agent can reach arbitrary hosts for the life of one job. That is accepted and
+stated rather than papered over — see SPEC.md. The run is ephemeral and single-tenant, and the
+credential that could do lasting damage is already dead by then.
+
+**`test_cmd` needs a runtime the image does not have.** It carries git and Node. A `test_cmd`
+needing php, python or ruby fails the job with an explicit message; use `test_cmd: null` and
+verify the patch in your CI.
 
 ## Docs
 
 | Doc | What's in it |
 | --- | --- |
 | [SPEC.md](./SPEC.md) | The full design: job spec, artifact shape, event schema, invariants |
-| [RUNNING.md](./RUNNING.md) | Local-dev walkthrough, wiring a Laravel caller, full-circle checklist |
-| [DEPLOY.md](./DEPLOY.md) | Building and running it in production |
+| [RUNNING.md](./RUNNING.md) | Running a job locally, wiring a Laravel caller |
+| [DEPLOY.md](./DEPLOY.md) | Building the image and wiring up Scaleway Serverless Jobs |
 
 ## Non-goals
 
 Pushing branches, opening PRs, storing repos or job history, knowing any caller's domain
-vocabulary, or retrying the task itself. See SPEC.md.
+vocabulary, retrying the task itself, or being a service. See SPEC.md.

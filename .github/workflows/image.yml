@@ -1,0 +1,210 @@
+# Builds the runner image and pushes it to Scaleway Container Registry.
+#
+# Ayos is not a service, so there is nothing here that restarts or drains
+# anything: the deliverable is an image, and a "deploy" is a job definition
+# being pointed at a new one. Runs already in flight keep the image they
+# started with, which is exactly what you want — a run is one job and it is
+# over in minutes.
+#
+# Required repository configuration:
+#
+#   Secrets   SCW_SECRET_KEY            Scaleway API secret key
+#   Variables SCW_REGISTRY_NAMESPACE    the registry namespace, e.g. "bilis"
+#             SCW_REGION                optional, defaults to fr-par
+#             SCW_JOB_DEFINITION_ID     optional; set it to roll the job
+#                                       definition forward automatically
+#
+# The API key needs ContainerRegistryFullAccess to push, and
+# ServerlessJobsFullAccess as well if you use the job-definition step.
+
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      update_job_definition:
+        description: 'Point the Scaleway job definition at the image this run builds'
+        type: boolean
+        default: false
+
+# A superseded commit's image is worth nothing, and the registry is not a
+# museum. Tag builds are exempt: those are releases and must always complete.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  SCW_REGION: ${{ vars.SCW_REGION || 'fr-par' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The gate. An image whose tests fail is not worth the registry space, and a
+  # run has no inbound surface to debug once it is out there.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm typecheck
+
+      - run: pnpm test
+
+      # The image runs `dist/`, not the sources, so a build that fails here
+      # would otherwise fail for the first time inside a container nobody can
+      # attach to.
+      - run: pnpm build
+
+  # ---------------------------------------------------------------------------
+  # Build, and push everywhere except a pull request.
+  # ---------------------------------------------------------------------------
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.reference.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the registry is configured
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -z "${{ vars.SCW_REGISTRY_NAMESPACE }}" ]; then
+            echo "::error::SCW_REGISTRY_NAMESPACE is not set. Add it under Settings → Secrets and variables → Actions → Variables."
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Scaleway Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: rg.${{ env.SCW_REGION }}.scw.cloud
+          # Scaleway's registry takes the literal username `nologin` and an API
+          # secret key as the password.
+          username: nologin
+          password: ${{ secrets.SCW_SECRET_KEY }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: rg.${{ env.SCW_REGION }}.scw.cloud/${{ vars.SCW_REGISTRY_NAMESPACE || 'unset' }}/ayos
+          # `latest` follows the tip of main. Version tags do NOT move it, so
+          # `latest` always means "newest build" rather than "newest release" —
+          # two things people assume interchangeably and then get surprised by.
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # Serverless Jobs run x86-64. Stated explicitly rather than inherited
+          # from the runner, so moving to arm runners fails loudly here instead
+          # of producing an image that dies with an exec-format error inside a
+          # container you cannot attach to.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # A plain single manifest rather than an image index with an
+          # attestation attached. Nothing here consumes provenance, and a
+          # single-platform image is the least surprising thing to hand a
+          # runtime that only has to pull and run it.
+          provenance: false
+          sbom: false
+
+      # The digest, not a tag: this is what a job definition should be pinned
+      # to if you want "the image we tested" to mean one exact set of bytes.
+      - name: Resolve the image reference
+        id: reference
+        if: github.event_name != 'pull_request'
+        run: |
+          image="rg.${SCW_REGION}.scw.cloud/${{ vars.SCW_REGISTRY_NAMESPACE }}/ayos@${{ steps.build.outputs.digest }}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${image}"
+            echo '```'
+            echo
+            echo "Tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Point the job definition at the image just built.
+  #
+  # Separate and opt-in: pushing an image is safe, changing what every
+  # subsequent job runs is a deployment. On a version tag it happens
+  # automatically; otherwise ask for it from the Actions tab.
+  # ---------------------------------------------------------------------------
+  job-definition:
+    needs: image
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.update_job_definition)
+    steps:
+      - name: Check the job definition is configured
+        run: |
+          if [ -z "${{ vars.SCW_JOB_DEFINITION_ID }}" ]; then
+            echo "::error::SCW_JOB_DEFINITION_ID is not set, so there is nothing to point at the new image."
+            exit 1
+          fi
+
+      - name: Update image_uri
+        env:
+          SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          set -euo pipefail
+
+          # Pinned by DIGEST, so the definition names one exact set of bytes
+          # rather than a tag someone could move underneath it later.
+          response=$(curl --fail-with-body -sS -X PATCH \
+            -H "X-Auth-Token: ${SCW_SECRET_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"image_uri\": \"${IMAGE}\"}" \
+            "https://api.scaleway.com/serverless-jobs/v1alpha2/regions/${SCW_REGION}/job-definitions/${{ vars.SCW_JOB_DEFINITION_ID }}")
+
+          echo "$response"
+
+          {
+            echo "### Job definition updated"
+            echo
+            echo '```'
+            echo "${IMAGE}"
+            echo '```'
+            echo
+            echo "Runs already in flight keep the image they started with."
+          } >> "$GITHUB_STEP_SUMMARY"

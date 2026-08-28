@@ -1,29 +1,11 @@
-# Native/binary deps that must run their install scripts. agentOS needs
-# better-sqlite3 (actor storage), isolated-vm (guest JS) and koffi (sidecar FFI);
-# esbuild backs tsx and vitest.
+# esbuild backs tsx and vitest. Nothing in the runtime tree compiles from source
+# any more: the agentOS/Rivet stack took better-sqlite3, isolated-vm and koffi
+# with it, which is also why the Dockerfile no longer needs a C++ toolchain.
+#
+# @google/genai and protobufjs arrive transitively through pi-ai's multi-provider
+# support. Their install scripts are optional and we do not use those providers,
+# so they are denied explicitly rather than left to warn on every install.
 allowBuilds:
-  '@google/genai': true
-  better-sqlite3: true
-  cbor-extract: true
   esbuild: true
-  isolated-vm: true
-  koffi: true
-  protobufjs: true
-
-# The rivet engine binary is published only as a musl build, statically linked
-# so it runs on glibc hosts too. Without this, pnpm's libc filtering skips it on
-# a glibc image and the engine cannot start. We cannot simply move to Alpine:
-# agentOS's own sidecar is published as a *-gnu (glibc) binary.
-supportedArchitectures:
-  libc:
-    - current
-    - musl
-
-# Transitive prod deps with published advisories that the parent packages have
-# not picked up yet. Each is a patch-level bump within the range its parent
-# already asks for, so nothing here changes an API we depend on.
-#   drizzle-orm  GHSA — SQL injection via unescaped identifiers
-#   uuid         GHSA — missing buffer bounds check in v3/v5/v6
-overrides:
-  drizzle-orm@<0.45.2: '>=0.45.2'
-  uuid@<11.1.1: '>=11.1.1'
+  '@google/genai': false
+  protobufjs: false

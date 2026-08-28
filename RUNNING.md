@@ -2,63 +2,25 @@
 
 Everything below is verified on macOS arm64, Node 24, pnpm 11.
 
-## 1. Install and generate keys
+## 1. Install
 
 ```sh
 pnpm install
+pnpm test
+```
+
+No engine to start, no key to configure, no `.env` to fill in. There is no service: `pnpm test`
+is the whole setup, and it takes about ten seconds.
+
+## 2. Make a job spec
+
+```sh
 pnpm keygen
 ```
 
-`pnpm keygen` prints two blocks: one for Ayos's `.env`, one for the caller's. Copy them across.
-Ayos gets the **public** key only — it can verify stream tokens but never mint them.
-
-Ayos `.env`:
-
-```
-PORT=8080
-AYOS_SHARED_SECRET=<from keygen>
-STREAM_JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----"
-ALLOWED_ORIGIN=http://localhost                 # your Laravel app's origin
-MAX_CONCURRENT_JOBS=4
-DEFAULT_TIMEOUT_S=900
-MAX_BODY_BYTES=1048576
-AYOS_HMAC_MODE=compat
-```
-
-No LLM key and no git credentials here — those arrive per job.
-
-## 2. Start it
-
-```sh
-pnpm dev
-```
-
-That starts the Rivet engine, waits for it to be genuinely healthy, then starts Ayos with
-file-watching. You should see:
-
-```
-[dev] starting rivet engine…
-[dev] engine healthy
-[dev] starting ayos…
-ayos listening on :8080
-```
-
-Check it: `curl localhost:8080/healthz` → `{"ok":true}`
-
-Two terminals instead, if you prefer:
-
-```sh
-pnpm engine                              # terminal 1
-AYOS_EXTERNAL_ENGINE=1 pnpm dev:server   # terminal 2
-```
-
-> **Why the engine runs separately.** rivetkit 2.3.9 can start its own engine, but its health
-> check gives up before the engine finishes booting on macOS arm64, and the process then retries
-> `failed to fetch metadata` forever without ever serving actors. `pnpm dev` sidesteps this. If you
-> ever see that message repeating, a stale engine is probably holding `:6420` — `pkill -f
-> rivet-engine` and retry.
-
-## 3. Send a job without writing any caller code
+That prints two lines: a `public_key` for the caller to keep, and a `signing_key` to put in the
+spec. In production these are minted **per job** — this exists so a local run has something to
+sign with.
 
 ```sh
 cat > /tmp/job.json <<'JSON'
@@ -68,7 +30,9 @@ cat > /tmp/job.json <<'JSON'
   "base_ref": "main",
   "base_sha": "<a real 40-char sha on that branch>",
   "clone_token": "ghs_…",
+  "llm_provider": "anthropic",
   "llm_key": "sk-ant-…",
+  "signing_key": "<from pnpm keygen>",
   "task": {
     "instructions": "Fix the failing assertion in tests/Feature/ExampleTest.php.",
     "context": "",
@@ -80,179 +44,174 @@ cat > /tmp/job.json <<'JSON'
     "max_diff_lines": 800,
     "path_denylist": [".github/**", ".env*"]
   },
-  "callback_url": "http://host.docker.internal:8000/api/ayos/artifacts"
+  "callback_url": "http://localhost:8125/artifact",
+  "events_url": "http://localhost:8125/events"
 }
 JSON
 
-AYOS_SHARED_SECRET=<secret> pnpm sign /tmp/job.json
+pnpm run:local /tmp/job.json
 ```
 
-`pnpm sign` signs the exact bytes it sends, prints the equivalent `curl`, and POSTs it. Also:
+`pnpm run:local` runs `src/entry.ts` with the spec in `AYOS_JOB_SPEC` — the same code path, the
+same environment variable, the same everything as the container. A job that works here is a job
+that works in a run.
 
-```sh
-pnpm sign /tmp/job.json --print       # headers + curl only, don't send
-pnpm sign --cancel   <job_id>
-pnpm sign --artifact <job_id>         # pull the artifact if the callback failed
+You need something listening on `callback_url`. `examples/translate-readme.mjs` is a complete one
+(and starts the run itself); for a bare receiver, anything that returns 2xx will do — the run
+does not care what you do with the artifact, only that you took it.
+
+**`test_cmd` should be `null` for a Laravel app.** The image carries git and Node. A `test_cmd`
+needing php, python or ruby fails the job immediately with a message saying so; let your CI verify
+the patch instead.
+
+## 3. Reading the output
+
+The run logs its phases to stdout and nothing else — no transcript, no secrets:
+
+```
+phase: cloning
+phase: fixing
+phase: packaging
+phase: done
+artifact delivered (done) after 1 attempt(s)
 ```
 
-**`test_cmd` should be `null` for a Laravel app.** The agentOS guest ships coreutils, grep, sed,
-gawk, findutils, tar and gzip — no PHP, node or python. A `test_cmd` needing one of those fails
-the job immediately with a message saying so. Let your CI verify the patch instead.
+Everything interesting is in the artifact and the event batches. If the callback never arrives,
+the exit code tells you which half failed: `1` means the job ran and the delivery did not, `2`
+means the spec was wrong.
 
 ---
 
 # Wiring a Laravel caller
 
-## Signing a request to Ayos
+The Bilis side of this is built, and the class names below are real ones — `AyosClient`,
+`RunKeyPair`, `RunDriver` with a `LocalRunDriver` and a `ScalewayRunDriver`, `FixJobEventRecorder`,
+`FixJobStreamController`. The local driver spawns this runner as a child process, which is how the
+whole path is exercised without a container registry in the loop.
 
-The signature covers the **raw body only**; the timestamp travels beside it as its own header.
-This matches Bilis's `VerifyAyosSignature` byte for byte, and a golden vector generated by PHP is
-pinned in `test/hmac.test.ts` so the two can't silently drift apart.
+## Starting a run
 
-```php
-$body = json_encode($jobSpec, JSON_UNESCAPED_SLASHES);
-$timestamp = (string) now()->getTimestamp();          // Unix SECONDS, not ISO-8601
-$signature = 'sha256=' . hash_hmac('sha256', $body, config('autofix.ayos.shared_secret'));
-
-$response = Http::withHeaders([
-    'Content-Type'     => 'application/json',
-    'X-Ayos-Signature' => $signature,
-    'X-Ayos-Timestamp' => $timestamp,
-])->withBody($body, 'application/json')->post(config('autofix.ayos.url') . '/jobs');
-
-// 202 => { job_id, state }   429 => at capacity, keep it queued and retry
-```
-
-Sign the exact bytes you send — encoding the array once and passing it with `withBody()` is the
-point. Letting the HTTP client re-encode it signs one string and transmits another.
-
-The timestamp must be within ±5 minutes of Ayos's clock. A repeat `job_id` returns the existing
-job rather than starting a second one, so retrying a timed-out dispatch is safe.
-
-## Verifying the artifact callback
-
-Ayos signs the callback with the **same secret**, the same way. Verify before trusting it:
+There is no Ayos endpoint to call. The control plane starts a run — a child process locally, a
+Serverless Job run in production — and puts the spec in that run's environment:
 
 ```php
-Route::post('/api/ayos/artifacts', function (Request $request) {
-    $raw       = $request->getContent();
-    $timestamp = $request->header('X-Ayos-Timestamp', '');
-    $provided  = $request->header('X-Ayos-Signature', '');
+// 1. One keypair for this job. Keep the public half; never keep the private one.
+$seed      = random_bytes(SODIUM_CRYPTO_SIGN_SEEDBYTES);
+$keypair   = sodium_crypto_sign_seed_keypair($seed);
+$publicKey = base64_encode(sodium_crypto_sign_publickey($keypair));
 
-    if (! ctype_digit($timestamp) || abs(now()->getTimestamp() - (int) $timestamp) > 300) {
-        abort(401, 'stale timestamp');
-    }
+$job->forceFill(['ayos_public_key' => $publicKey])->save();
 
-    $expected = 'sha256=' . hash_hmac('sha256', $raw, config('autofix.ayos.shared_secret'));
-    if (! hash_equals($expected, $provided)) {
-        abort(401, 'bad signature');
-    }
+// 2. The spec, with the private half inside it.
+$spec = json_encode([
+    'job_id'       => $job->uuid,
+    'repo'         => $repository->repo_full_name,
+    'base_ref'     => $repository->default_branch,
+    'base_sha'     => $baseSha,
+    'clone_token'  => $cloneToken,          // see the warning below
+    'llm_provider' => $credential->provider->value,   // which provider the key is for
+    'llm_key'      => $credential->key,
+    'llm_host'     => $credential->host(),
+    'signing_key'  => base64_encode($seed),
+    'task'         => $taskRenderer->render($job),
+    'constraints'  => [...],
+    'callback_url' => route('api.internal.autofix.artifacts'),
+    'events_url'   => route('api.internal.autofix.events'),
+], JSON_UNESCAPED_SLASHES);
 
-    $artifact = json_decode($raw, true);
-    // $artifact['status']  done | failed | cancelled | timeout
-    // $artifact['diff']    unified diff against base_sha — apply it yourself, Ayos never pushes
-    // $artifact['report']  summary, files_touched, tests, durations, links
-    // $artifact['events']  full transcript, for your persisted record
-
-    return response()->noContent();
-});
+// 3. Start the run, and RECORD ITS ID — it is the only handle you have afterwards.
+$runId = $this->runs->start($spec, $job->uuid);   // RunDriver: local or scaleway
+$job->forceFill(['ayos_run_id' => $runId])->save();
 ```
 
-Use `hash_equals`, not `===`. Ayos retries 3× with backoff on 5xx/408/429 and gives up on other
-4xx, so return 2xx only once you've actually stored it. If every attempt fails, the artifact stays
-retrievable from `GET /jobs/:id/artifact`.
+The public key goes on the row **before** the run starts. A run can post its first event batch
+within a second of starting, and a callback arriving before its own verification key is a 401 on a
+perfectly good job.
 
-**Re-validate the diff on your side.** Ayos enforces `path_denylist` and `max_diff_lines`, but the
-spec has the caller check too — a patch produced by an agent that read attacker-influenced context
-is not something to apply on trust.
+> **The clone token is now single-use.** Ayos revokes it the moment the clone finishes, because it
+> enters the same container as the agent. `GitHubAppTokenService` caches read-only installation
+> tokens for 50 minutes and shares them between call sites, so the Ayos call site passes
+> `fresh: true` — without it the next job is dispatched with a credential the previous run
+> destroyed, and the failure reads as a permissions problem rather than a caching one.
 
-## Minting a stream token for the browser
+## Verifying what comes back
 
-Ed25519, ~10 minute expiry, scoped to one job. Bilis already implements this in
-`App\Services\Autofix\StreamTokenIssuer` using libsodium (no JWT package needed):
+Same signed string as before — `{timestamp}.{raw body}` — with Ed25519 instead of HMAC, and the
+key looked up per job:
 
 ```php
-$seed = base64_decode(config('autofix.stream_jwt.private_key'), true);
-$sk   = sodium_crypto_sign_secretkey(sodium_crypto_sign_seed_keypair($seed));
+$raw       = $request->getContent();
+$timestamp = (string) $request->header('X-Ayos-Timestamp', '');
+$provided  = (string) $request->header('X-Ayos-Signature', '');
 
-$b64     = fn ($v) => rtrim(strtr(base64_encode($v), '+/', '-_'), '=');
-$header  = $b64(json_encode(['alg' => 'EdDSA', 'typ' => 'JWT'], JSON_UNESCAPED_SLASHES));
-$payload = $b64(json_encode([
-    'sub'   => (string) $viewer->getKey(),   // viewer id, for audit
-    'job'   => $jobId,                       // the ONE job this token may watch
-    'scope' => 'stream:read',
-    'iat'   => time(),
-    'exp'   => time() + 600,
-], JSON_UNESCAPED_SLASHES));
+if (! ctype_digit($timestamp) || abs(now()->getTimestamp() - (int) $timestamp) > 300) {
+    abort(401, 'stale timestamp');
+}
+if (! str_starts_with($provided, 'ed25519=')) {
+    abort(401, 'bad signature');
+}
 
-$signingInput = $header . '.' . $payload;
-$token = $signingInput . '.' . $b64(sodium_crypto_sign_detached($signingInput, $sk));
+// The job id comes out of an UNVERIFIED body — parse it, use it only to find
+// the key, and trust nothing else until the signature checks out.
+$jobId = json_decode($raw, true)['job_id'] ?? null;
+$job   = FixJob::query()->where('uuid', $jobId)->firstOrFail();
+
+$valid = sodium_crypto_sign_verify_detached(
+    base64_decode(substr($provided, strlen('ed25519='))),
+    $timestamp.'.'.$raw,
+    base64_decode($job->ayos_public_key),
+);
+abort_unless($valid, 401, 'bad signature');
 ```
 
-`AUTOFIX_STREAM_PRIVATE_KEY` is the base64 seed `pnpm keygen` printed (`StreamTokenIssuer` accepts either the 32-byte seed or the 64-byte secret key). Ayos rejects the token if `job`
-doesn't match the URL, if `scope` is wrong, or if it's expired — and it only ever holds the public
-key, so a compromised Ayos still can't mint one.
+Use the same check on both the artifact route and the new events route.
 
-## Consuming the stream
+**Re-validate the diff on your side.** Ayos enforces `path_denylist` and `max_diff_lines`, but a
+patch produced by an agent that read attacker-influenced context is not something to apply on
+trust. `DiffValidator` already does this and should keep doing it.
 
-```js
-const es = new EventSource(`${AYOS_URL}/jobs/${jobId}/stream?token=${token}`);
-es.addEventListener('phase',         e => console.log('phase',  JSON.parse(e.data).data.state));
-es.addEventListener('agent_message', e => append(JSON.parse(e.data).data.text));
-es.addEventListener('tool_call',     e => console.log('tool',   JSON.parse(e.data).data.title));
-es.addEventListener('done',          e => es.close());
+## The event stream
+
+Ayos no longer serves browsers. It POSTs batches of events to `events_url` and Laravel fans them
+out — which means `StreamTokenIssuer` now guards a Laravel route rather than an Ayos one, and the
+CORS and `exp`-at-connect-time subtleties are gone with the endpoint they belonged to.
+
+```php
+// POST /api/internal/autofix/events   { job_id, events: [{ seq, ts, type, data }, ...] }
+// Append by `seq`, ignoring anything you already have: batches can arrive
+// twice or out of order, and the artifact carries the authoritative copy anyway.
 ```
 
-On connect Ayos replays the ring buffer, then streams live. `EventSource` sends `Last-Event-ID`
-automatically on reconnect, so a dropped connection resumes from the last `seq` rather than
-replaying everything.
+Delivery is best-effort by design: a run whose events endpoint is down still finishes, still
+delivers its artifact, and the artifact's `events` array is complete. Never treat a gap in the
+live stream as a failed job.
 
-`exp` is checked **at connect time only** — a stream that's already open isn't killed when the
-token expires. Mint a fresh one per connection attempt. Set `ALLOWED_ORIGIN` to your Laravel
-origin or the browser will be refused.
+## Reconciling a run that never answered
+
+Two signals, and you need both — see DEPLOY.md §5. `StaleFixJobReaper` already fails anything
+unanswered after `timeout_s + 10 minutes`; polling the run status for those jobs turns "eventually
+declared lost" into "known failed", and distinguishes a crashed run from a slow one.
 
 ---
 
-# Full-circle with Bilis
-
-`../ayos/.env` and `../bilis/.env` are already paired (one `pnpm keygen`, shared secret in both,
-public half in Ayos and the seed in Bilis). Verified working: a request signed by PHP with Bilis's
-secret passes Ayos's HMAC check, and a token minted by Bilis's sodium path is accepted for its own
-job and rejected for any other.
-
-What Bilis has wired: `AUTOFIX_ENABLED=true`, `AUTOFIX_AYOS_URL` and `AUTOFIX_AYOS_STREAM_URL` at
-`http://localhost:8080`, the shared secret, the stream seed, and an already-configured GitHub App
-for minting `contents: read` clone tokens.
-
-**The one thing left blank is `AUTOFIX_ANTHROPIC_API_KEY`** — fill it in `../bilis/.env`. It is
-forwarded per job as `llm_key` and handed to Pi inside the VM.
-
-Then, per repository, `project_repositories.autofix_enabled` has to be on, and `test_cmd` should be
-`null` (no PHP in the VM).
-
 # Full-circle checklist
 
-1. `pnpm keygen`, split the output into both `.env` files. **Already done for ayos + bilis.**
-2. `pnpm dev` — wait for `ayos listening on :8080`.
-3. `curl localhost:8080/healthz` → `{"ok":true}`.
-4. Bilis's callback route is `POST /api/internal/autofix/artifacts`, behind the `ayos.signature`
-   middleware. On one machine `http://localhost:8000` reaches it fine.
-5. Dispatch a job — either from Bilis, or by hand with `pnpm sign` using a **real** `base_sha`, a
-   repo-scoped `clone_token`, and `test_cmd: null`.
-6. Watch `pnpm dev`'s output for the phase transitions: `cloning → fixing → packaging → done`.
-7. Confirm your callback fired and the diff applies: `git apply --check` against `base_sha`.
-
-If the callback never arrives, pull it directly — `pnpm sign --artifact <job_id>` — which
-distinguishes "the job failed" from "the callback couldn't reach you".
+1. `pnpm test` — 244 green.
+2. Build and push the image; create the job definition (DEPLOY.md §1–2).
+3. `pnpm run:local` with a **real** `base_sha`, a repo-scoped `clone_token` and `test_cmd: null` —
+   this proves the spec and the callback before the platform is involved.
+4. Start one run from Laravel and watch the phases arrive on the events route.
+5. Confirm the diff applies: `git apply --check` against `base_sha`.
+6. Kill a run mid-flight and confirm you get a `cancelled` artifact, or that the reaper catches it.
 
 ## When something goes wrong
 
 | Symptom | Cause |
 | --- | --- |
-| `failed to fetch metadata` on repeat | Stale engine on `:6420`. `pkill -f rivet-engine`, restart. |
-| `401 unauthorized` / `signature mismatch` | Signed a re-encoded body instead of the raw bytes, or clock skew > 5 min. |
-| `422 invalid job spec` | Response lists the exact failing fields — `base_sha` must be hex, `repo` must be `org/name`. |
-| `429 at capacity` | More than `MAX_CONCURRENT_JOBS` in flight. Keep it queued caller-side; Ayos holds no backlog. |
-| Job fails with `test_cmd requires …` | The VM has no language runtimes. Use `test_cmd: null`. |
-| Job fails with `egress allowlist is not being enforced` | The sandbox isn't containing network access. Investigate before running anything real — do not set `AYOS_SKIP_EGRESS_CHECK=1` to get past it except against a VM you trust. |
-| Clone fails with an auth error | `clone_token` needs repo read scope and must not be expired. |
+| Run exits `2` immediately | Spec missing or invalid. The message names the field. |
+| Run exits `1` | The job ran; the callback could not be delivered. Check `callback_url` from inside the run's network, not from your laptop. |
+| `401` on the callback | Verifying against the wrong job's public key, or re-encoding the body before verifying. Sign and verify the raw bytes. |
+| `clone failed` | `clone_token` lacks repo read scope, is expired, or was already revoked — a cached token from a previous job is the likely one. |
+| `test_cmd requires …` | The image has no language runtimes. Use `test_cmd: null`. |
+| Job fails with `model … is not in the anthropic catalog` | `AYOS_PI_MODEL` names a model the pinned SDK does not know. Bump the SDK or pick a known id — it fails loudly on purpose rather than silently using a different model. |
+| `exec format error` at start | An arm64 image on x86-64. Build with `--platform linux/amd64`. |

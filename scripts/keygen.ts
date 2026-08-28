@@ -1,37 +1,24 @@
 /**
- * Mints the Ed25519 keypair used for browser stream tokens, plus a shared
- * secret. Ayos gets the PUBLIC key only; the caller keeps the private key and
- * is the only party that can mint stream tokens.
+ * Generates one Ed25519 keypair, for local testing.
  *
- *   pnpm keygen
+ * In production these are minted **per job** by the control plane: it keeps the
+ * public half on the job record and injects the private half into that one run.
+ * There is no long-lived key to generate any more, and nothing here belongs in
+ * a deployment's environment — this exists so `pnpm run:local` has something to
+ * sign with.
  */
-import { generateKeyPair, exportSPKI, exportPKCS8, exportJWK } from "jose";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync } from "node:crypto";
+import { publicKeyBase64 } from "../src/auth/sign.ts";
 
-const { publicKey, privateKey } = await generateKeyPair("EdDSA", {
-  crv: "Ed25519",
-  extractable: true,
-});
+const { privateKey } = generateKeyPairSync("ed25519");
+// The 32-byte seed, which is what libsodium's `sodium_crypto_sign_seed_keypair`
+// takes on the PHP side — the same shape Bilis already stores for stream tokens.
+const seed = Buffer.from(
+  privateKey.export({ format: "der", type: "pkcs8" }).subarray(16),
+).toString("base64");
 
-const spki = await exportSPKI(publicKey);
-const pkcs8 = await exportPKCS8(privateKey);
-const secret = randomBytes(32).toString("hex");
-
-// The 32-byte Ed25519 seed, base64. PHP's sodium takes this directly
-// (sodium_crypto_sign_seed_keypair), which saves the caller parsing PEM.
-const jwk = await exportJWK(privateKey);
-const seedB64 = Buffer.from(jwk.d as string, "base64url").toString("base64");
-
-const oneLine = (pem: string) => pem.trim().replace(/\n/g, "\\n");
-
-console.log("# ---- Ayos (.env) ----------------------------------------------");
-console.log(`AYOS_SHARED_SECRET=${secret}`);
-console.log(`STREAM_JWT_PUBLIC_KEY="${oneLine(spki)}"`);
+console.log("# The caller keeps this, and puts it on the job row:");
+console.log(`public_key  = ${publicKeyBase64(privateKey)}`);
 console.log("");
-console.log("# ---- Caller, e.g. Laravel (.env) ------------------------------");
-console.log("# Same shared secret, both directions (dispatch + artifact callback).");
-console.log(`AYOS_SHARED_SECRET=${secret}`);
-console.log("# Private key — mints stream tokens. Ayos never sees this.");
-console.log(`AYOS_STREAM_JWT_PRIVATE_KEY="${oneLine(pkcs8)}"`);
-console.log("# Same key as a raw seed, for PHP/sodium (see README).");
-console.log(`AYOS_STREAM_JWT_SEED=${seedB64}`);
+console.log("# The caller injects this into the one run it belongs to:");
+console.log(`signing_key = ${seed}`);

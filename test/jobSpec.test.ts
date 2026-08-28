@@ -7,6 +7,7 @@ const VALID = {
   base_ref: "main",
   base_sha: "abc1234",
   clone_token: "ghs_token",
+  signing_key: "A".repeat(43) + "=",
   llm_key: "sk-ant-key",
   task: { instructions: "Fix the thing." },
   callback_url: "https://caller.test/artifacts",
@@ -25,6 +26,19 @@ describe("valid specs", () => {
       path_denylist: [],
     });
     expect(res.constraints.timeout_s).toBeUndefined();
+    // Every spec written before providers existed meant Anthropic.
+    expect(res.llm_provider).toBe("anthropic");
+  });
+
+  it("keeps the provider the caller named", () => {
+    expect(parse({ llm_provider: "openrouter" }).success).toBe(true);
+    expect(JobSpec.parse({ ...VALID, llm_provider: "openai" }).llm_provider).toBe("openai");
+  });
+
+  it("refuses a provider it has no catalogue for", () => {
+    // A runner that accepted an unknown provider would send a customer's key
+    // somewhere it does not work, and only find out mid-run.
+    expect(parse({ llm_provider: "mistral" }).success).toBe(false);
   });
 
   it("keeps supplied values instead of defaults", () => {
@@ -132,12 +146,16 @@ describe("other required fields", () => {
     expect(parse({ task: { instructions: "" } }).success).toBe(false);
   });
 
+  // The ceiling is the platform's own maximum run duration: 24 hours. A spec
+  // asking for longer would be accepted here and then truncated by the run,
+  // which is the confusing failure this rejects up front.
   it("rejects an out-of-range or non-integer timeout", () => {
     expect(parse({ constraints: { timeout_s: 0 } }).success).toBe(false);
     expect(parse({ constraints: { timeout_s: -1 } }).success).toBe(false);
-    expect(parse({ constraints: { timeout_s: 3601 } }).success).toBe(false);
+    expect(parse({ constraints: { timeout_s: 86401 } }).success).toBe(false);
     expect(parse({ constraints: { timeout_s: 12.5 } }).success).toBe(false);
-    expect(parse({ constraints: { timeout_s: 3600 } }).success).toBe(true);
+    expect(parse({ constraints: { timeout_s: 86400 } }).success).toBe(true);
+    expect(parse({ constraints: { timeout_s: 900 } }).success).toBe(true);
   });
 
   it("rejects a non-positive max_diff_lines", () => {

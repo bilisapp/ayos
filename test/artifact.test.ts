@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from "node:crypto";
 import { chmod, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -8,10 +9,14 @@ import {
   violatesDenylist,
 } from "../src/artifact/package.ts";
 import { deliverArtifact } from "../src/artifact/callback.ts";
-import { SIGNATURE_HEADER, TIMESTAMP_HEADER, verify } from "../src/auth/hmac.ts";
-import { WORKDIR } from "../src/git/clone.ts";
+import {
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  loadSigningKey,
+  publicKeyBase64,
+  verifySignature,
+} from "../src/auth/sign.ts";
 import type { Artifact } from "../src/types.ts";
-import { FakeSandbox } from "./helpers/fakeSandbox.ts";
 import { commitAll, git, installGitConfig, makeTempDir, seedRepo, writeIn } from "./helpers/tempRepo.ts";
 
 /**
@@ -336,55 +341,112 @@ describe("requiredToolFor", () => {
 
 /* ------------------------------------------------------------------ runTests */
 
+/**
+ * These run real processes now. There is no sandbox to fake: the command runs
+ * as a child of the runner, in the checkout, and the interesting behaviour —
+ * the timeout actually killing something — is only observable for real.
+ */
 describe("runTests", () => {
-  it("runs the command through a login shell in the workdir and maps exit 0 to passed", async () => {
-    const sb = new FakeSandbox(() => ({ exitCode: 0, stdout: "OK (12 tests)" }));
-    const res = await runTests(sb, "php artisan test --compact", { timeoutMs: 5000 });
+  let dir: string;
 
-    expect(sb.execCalls[0]!.cmd).toBe("sh");
-    expect(sb.execCalls[0]!.args).toEqual(["-lc", "php artisan test --compact"]);
-    expect(sb.execCalls[0]!.opts?.cwd).toBe(WORKDIR);
-    expect(sb.execCalls[0]!.opts?.timeoutMs).toBe(5000);
+  beforeAll(async () => {
+    dir = await makeTempDir("ayos-test-runtests-");
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("runs the command in the checkout and maps exit 0 to passed", async () => {
+    const res = await runTests(dir, "echo 'OK (12 tests)'", { timeoutMs: 5000 });
+
     expect(res.passed).toBe(true);
-    expect(res.cmd).toBe("php artisan test --compact");
+    expect(res.cmd).toBe("echo 'OK (12 tests)'");
     expect(res.output_tail).toBe("OK (12 tests)");
     expect(res.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("runs in the given directory, not the process cwd", async () => {
+    const res = await runTests(dir, "pwd");
+    // macOS resolves /var through a symlink to /private/var.
+    expect(res.output_tail.endsWith(dir) || dir.endsWith(res.output_tail)).toBe(true);
+  });
+
   it("maps a non-zero exit to failed and keeps stderr in the tail", async () => {
-    const sb = new FakeSandbox(() => ({ exitCode: 1, stdout: "1 failed", stderr: "boom" }));
-    const res = await runTests(sb, "pnpm test");
+    const res = await runTests(dir, "echo '1 failed'; echo boom >&2; exit 1");
     expect(res.passed).toBe(false);
     expect(res.output_tail).toContain("1 failed");
     expect(res.output_tail).toContain("boom");
   });
 
   it("treats any non-zero code as failure, not just 1", async () => {
-    const sb = new FakeSandbox(() => ({ exitCode: 137, stdout: "killed" }));
-    expect((await runTests(sb, "x")).passed).toBe(false);
+    expect((await runTests(dir, "exit 42")).passed).toBe(false);
   });
 
   it("keeps the TAIL of huge output, capped at 8 KB", async () => {
-    const stdout = Array.from({ length: 20000 }, (_, i) => `line ${i}`).join("\n");
-    const sb = new FakeSandbox(() => ({ exitCode: 1, stdout }));
-    const res = await runTests(sb, "noisy");
+    const res = await runTests(dir, "for i in $(seq 0 19999); do echo \"line $i\"; done");
 
     expect(res.output_tail.length).toBeLessThanOrEqual(8192);
-    expect(res.output_tail.endsWith("line 19999")).toBe(true);
+    expect(res.output_tail.trim().endsWith("line 19999")).toBe(true);
     expect(res.output_tail).not.toContain("line 0\n");
   });
 
-  it("passes the abort signal through", async () => {
+  /*
+   * The invariant that matters most here: a hung test_cmd cannot outlive the
+   * job budget. `sleep 60` in a shell is a CHILD of that shell, so killing the
+   * shell alone leaves it running — which is exactly the bug the process-group
+   * kill in `exec` exists to prevent.
+   */
+  it("kills a hanging command at the timeout instead of waiting for it", async () => {
+    const started = Date.now();
+    const res = await runTests(dir, "sleep 60", { timeoutMs: 300 });
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(res.passed).toBe(false);
+  });
+
+  it("kills the whole process group, not just the shell", async () => {
+    const marker = join(dir, `group-${process.pid}-${Date.now()}.txt`);
+    // The backgrounded subshell outlives its parent unless the GROUP is killed.
+    const res = await runTests(dir, `(sleep 1; echo survived > ${marker}) & sleep 30`, {
+      timeoutMs: 300,
+    });
+    expect(res.passed).toBe(false);
+
+    await new Promise((r) => setTimeout(r, 1500));
+    await expect(stat(marker)).rejects.toThrow();
+  });
+
+  it("stops on an abort signal", async () => {
     const ac = new AbortController();
-    const sb = new FakeSandbox(() => ({ exitCode: 0 }));
-    await runTests(sb, "x", { signal: ac.signal });
-    expect(sb.execCalls[0]!.opts?.signal).toBe(ac.signal);
+    setTimeout(() => ac.abort(), 100);
+    const started = Date.now();
+    const res = await runTests(dir, "sleep 30", { signal: ac.signal });
+
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(res.passed).toBe(false);
   });
 });
 
 /* ----------------------------------------------------------- deliverArtifact */
 
-const SECRET = "shared-secret-for-the-callback";
+/**
+ * One keypair, standing in for the pair the caller mints per job: the run signs
+ * with the private half, the caller verifies with the public one.
+ */
+const SIGNING_SEED = Buffer.from(
+  generateKeyPairSync("ed25519").privateKey.export({ format: "der", type: "pkcs8" }).subarray(16),
+).toString("base64");
+const KEY = loadSigningKey(SIGNING_SEED);
+const PUBLIC_KEY = publicKeyBase64(KEY);
+const OTHER_PUBLIC_KEY = publicKeyBase64(
+  loadSigningKey(
+    Buffer.from(
+      generateKeyPairSync("ed25519").privateKey.export({ format: "der", type: "pkcs8" }).subarray(16),
+    ).toString("base64"),
+  ),
+);
+
 const DIFF_HEADER = "diff --git a/app/Foo.php b/app/Foo.php";
 
 function artifact(): Artifact {
@@ -426,7 +488,7 @@ describe("deliverArtifact", () => {
   it("succeeds on the first try and does not sleep", async () => {
     const { impl, calls } = stubFetch([200]);
     const sleep = vi.fn(async () => {});
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep,
     });
@@ -438,10 +500,10 @@ describe("deliverArtifact", () => {
     expect(calls[0]!.init.method).toBe("POST");
   });
 
-  it("sends the artifact as JSON with HMAC headers that verify() accepts", async () => {
+  it("sends the artifact as JSON, signed with this run's key", async () => {
     const { impl, calls } = stubFetch([204]);
     const art = artifact();
-    await deliverArtifact("https://caller.test/artifacts", art, SECRET, {
+    await deliverArtifact("https://caller.test/artifacts", art, KEY, {
       fetchImpl: impl,
       sleep: noSleep,
     });
@@ -452,34 +514,34 @@ describe("deliverArtifact", () => {
 
     expect(headers["content-type"]).toBe("application/json");
     expect(JSON.parse(body)).toEqual(art);
-    expect(headers[SIGNATURE_HEADER]).toMatch(/^sha256=[0-9a-f]{64}$/);
+    expect(headers[SIGNATURE_HEADER]).toMatch(/^ed25519=[A-Za-z0-9+/]+=*$/);
 
     expect(
-      verify(SECRET, body, {
+      verifySignature(PUBLIC_KEY, body, {
         signature: headers[SIGNATURE_HEADER],
         timestamp: headers[TIMESTAMP_HEADER],
       }),
-    ).toEqual({ ok: true });
+    ).toBe(true);
 
     // and the signature is genuinely over this body
     expect(
-      verify(SECRET, `${body} `, {
+      verifySignature(PUBLIC_KEY, `${body} `, {
         signature: headers[SIGNATURE_HEADER],
         timestamp: headers[TIMESTAMP_HEADER],
-      }).ok,
+      }),
     ).toBe(false);
-    // ...with the right secret
+    // ...and only this run's key verifies it
     expect(
-      verify("wrong-secret", body, {
+      verifySignature(OTHER_PUBLIC_KEY, body, {
         signature: headers[SIGNATURE_HEADER],
         timestamp: headers[TIMESTAMP_HEADER],
-      }).ok,
+      }),
     ).toBe(false);
   });
 
   it("re-signs each retry so the timestamp stays inside the window", async () => {
     const { impl, calls } = stubFetch([500, 200]);
-    await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep: noSleep,
       backoffMs: [0, 0],
@@ -487,10 +549,10 @@ describe("deliverArtifact", () => {
     for (const c of calls) {
       const h = c.init.headers as Record<string, string>;
       expect(
-        verify(SECRET, c.init.body as string, {
+        verifySignature(PUBLIC_KEY, c.init.body as string, {
           signature: h[SIGNATURE_HEADER],
           timestamp: h[TIMESTAMP_HEADER],
-        }).ok,
+        }),
       ).toBe(true);
     }
   });
@@ -498,7 +560,7 @@ describe("deliverArtifact", () => {
   it("retries after a 500 and reports success on the second attempt", async () => {
     const { impl, calls } = stubFetch([500, 200]);
     const sleep = vi.fn(async () => {});
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep,
       backoffMs: [111, 222],
@@ -513,7 +575,7 @@ describe("deliverArtifact", () => {
   it("gives up after 3 attempts and reports the last status", async () => {
     const { impl, calls } = stubFetch([500, 502, 503]);
     const sleep = vi.fn(async () => {});
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep,
       backoffMs: [1, 2, 3],
@@ -531,7 +593,7 @@ describe("deliverArtifact", () => {
   it("does not retry a 422 — the caller rejected the artifact", async () => {
     const { impl, calls } = stubFetch([422, 200]);
     const sleep = vi.fn(async () => {});
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep,
     });
@@ -548,7 +610,7 @@ describe("deliverArtifact", () => {
 
   it.each([400, 401, 403, 404, 422])("does not retry %i", async (status) => {
     const { impl, calls } = stubFetch([status, 200]);
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep: noSleep,
     });
@@ -558,7 +620,7 @@ describe("deliverArtifact", () => {
 
   it.each([408, 429])("does retry %i (transient)", async (status) => {
     const { impl, calls } = stubFetch([status, 200]);
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep: noSleep,
     });
@@ -568,7 +630,7 @@ describe("deliverArtifact", () => {
 
   it("retries network errors and surfaces the message on final failure", async () => {
     const { impl, calls } = stubFetch([new Error("ECONNREFUSED")]);
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep: noSleep,
     });
@@ -582,7 +644,7 @@ describe("deliverArtifact", () => {
 
   it("recovers when the network error is transient", async () => {
     const { impl } = stubFetch([new Error("EAI_AGAIN"), 200]);
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep: noSleep,
     });
@@ -592,7 +654,7 @@ describe("deliverArtifact", () => {
   it("honours a custom attempt count and reuses the last backoff when it runs short", async () => {
     const { impl, calls } = stubFetch([500, 500, 500, 500, 200]);
     const sleep = vi.fn(async () => {});
-    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), SECRET, {
+    const res = await deliverArtifact("https://caller.test/artifacts", artifact(), KEY, {
       fetchImpl: impl,
       sleep,
       attempts: 5,
@@ -602,4 +664,25 @@ describe("deliverArtifact", () => {
     expect(calls).toHaveLength(5);
     expect(sleep.mock.calls).toEqual([[7], [9], [9], [9]]);
   });
+});
+
+describe("runTests with an already-aborted signal", () => {
+  /*
+   * The budget can expire between the decision to run a command and the spawn.
+   * An `abort` listener added to a signal that has already fired never runs, so
+   * this would otherwise be the one path where a long test_cmd runs in full
+   * after the job was already over.
+   */
+  it("does not run the command to completion", async () => {
+    const dir = await makeTempDir("ayos-test-aborted-");
+    try {
+      const started = Date.now();
+      const res = await runTests(dir, "sleep 30", { signal: AbortSignal.abort() });
+
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(res.passed).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

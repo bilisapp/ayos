@@ -31,7 +31,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   return { ...actual, execFile: wrapped, default: { ...actual, execFile: wrapped } };
 });
 
-const { CloneError, WORKDIR, shallowClone } = await import("../src/git/clone.ts");
+const { CloneError, shallowClone } = await import("../src/git/clone.ts");
 const { commitAll, git, initRepo, installGitConfig, makeTempDir, writeIn } = await import(
   "./helpers/tempRepo.ts"
 );
@@ -387,12 +387,6 @@ describe("token handling — environment", () => {
     },
     TIMEOUT,
   );
-});
-
-describe("mount point", () => {
-  it("exposes the in-VM mount path the checkout is bound to", () => {
-    expect(WORKDIR).toBe("/work/repo");
-  });
 });
 
 /** Recursive content grep, including .git. Returns the number of matching files. */

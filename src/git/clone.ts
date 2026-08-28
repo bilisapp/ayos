@@ -29,9 +29,6 @@ function isolatedGitConfig(): Record<string, string> {
   };
 }
 
-/** Where the host clone is mounted inside the VM. */
-export const WORKDIR = "/work/repo";
-
 export interface CloneOptions {
   repo: string;
   baseRef: string;
@@ -43,7 +40,7 @@ export interface CloneOptions {
 }
 
 export interface Checkout {
-  /** Absolute host path of the clone — this is what gets mounted into the VM. */
+  /** Absolute path of the clone. This is the agent's working directory. */
   hostPath: string;
   durationMs: number;
   cleanup(): Promise<void>;
@@ -66,19 +63,13 @@ function stderrOf(err: unknown): string {
 }
 
 /**
- * Clones on the HOST, not in the VM. agentOS's `@agentos-software/git` package
- * does install a real `git` at /opt/agentos/bin/git, but it implements only a
- * slice of git: `clone`, `checkout`, `commit` and `rev-parse` work, while
- * `add`, `diff`, `status`, `ls-files` and `config` all exit 128 with
- * `GitSubcommandUnsupported` (probed against 0.3.3). Packaging needs exactly
- * the missing half, so the clone happens here and the tree is mounted in.
+ * Clones into a temp directory the agent will then work in.
  *
- * This is also the better security position. The clone token never enters the
- * VM at all, so the agent cannot reach it even if the prompt fence fails —
- * previously it was one `cat` away from a credential.
- *
- * The token still never reaches argv or .git/config: it goes through a one-shot
- * GIT_ASKPASS script that is deleted immediately after the clone.
+ * The token never reaches argv, `.git/config` or shell history: it goes through
+ * a one-shot GIT_ASKPASS script that is deleted immediately after the clone.
+ * That is all this can do about the credential — it lives in the same container
+ * as the agent, so it is `revokeCloneToken()` a moment later that actually
+ * takes it out of play.
  */
 export async function shallowClone(opts: CloneOptions): Promise<Checkout> {
   const host = opts.host ?? "github.com";

@@ -1,32 +1,33 @@
 # syntax=docker/dockerfile:1
 
 # ---------------------------------------------------------------------------
-# Build stage: native modules and the TypeScript build.
+# Ayos runner: one container, one job, then exit.
 #
-# agentOS pulls in three modules that compile from source — better-sqlite3
-# (actor storage), isolated-vm (guest JS) and koffi (sidecar FFI) — so the build
-# stage needs a full C++ toolchain. The runtime stage does not.
+# There is no server in here. The image is the body of a Serverless Job run:
+# the spec arrives as environment, the job runs, the artifact is POSTed, the
+# process exits, and the exit code is what the platform records. Nothing
+# listens, so nothing needs a port, a health check or a volume.
+#
+# Nothing compiles from source any more either. The agentOS stack took
+# better-sqlite3, isolated-vm and koffi with it, and with them the C++
+# toolchain, the `MAKEFLAGS=-j1` OOM workaround and most of the build time.
 # ---------------------------------------------------------------------------
 FROM node:24-bookworm-slim AS build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 make g++ ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
-RUN corepack enable && corepack prepare pnpm@11.11.0 --activate
+# Corepack asks for confirmation before downloading a package manager, and a
+# prompt in a non-interactive build is a hang or a failure depending on the
+# version. Answer it up front.
+ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN corepack enable
 
 WORKDIR /app
 
-# isolated-vm is a large C++ build. Left to itself node-gyp spawns one compiler
-# job per core, and several concurrent v8 translation units will OOM a modest
-# builder — which shows up as the daemon dying, not as a clean error.
-ENV npm_config_jobs=1 \
-    JOBS=1 \
-    MAKEFLAGS=-j1
-
-# Dependencies first, so a source-only change doesn't rebuild isolated-vm.
+# Dependencies first, so a source-only change does not refetch them.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+
+# The pnpm version comes from package.json's `packageManager` field, so CI and
+# this image cannot drift apart by pinning it in two places.
+RUN corepack prepare --activate
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile
 
@@ -35,8 +36,7 @@ COPY src ./src
 COPY scripts ./scripts
 RUN pnpm build
 
-# Drop dev dependencies. Runs after the build so tsc is still available above,
-# and does not touch the already-compiled native modules.
+# Drop dev dependencies. After the build, so tsc is still available above.
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm prune --prod
 
@@ -45,39 +45,30 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 # ---------------------------------------------------------------------------
 FROM node:24-bookworm-slim AS runtime
 
-# git is a RUNTIME dependency: agentOS's own git implements clone/checkout but
-# not add/diff (see SPEC), so Ayos clones AND diffs on the host and mounts the
-# checkout into the VM. Without git here, every job fails at the first phase.
+# git is a RUNTIME dependency: Ayos clones the repository and computes the diff
+# itself — the agent is never the one holding the pen that writes its own
+# artifact. Without git here, every job fails at the first phase.
+#
+# `ca-certificates` for TLS to GitHub, the model provider and the callback.
+# `tini` reaps whatever the agent's `bash` leaves behind: a run that ends with
+# an orphaned child would otherwise keep PID 1 waiting.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
-ENV NODE_ENV=production \
-    PORT=8080 \
-    HOME=/data
+ENV NODE_ENV=production
 
 WORKDIR /app
 
 # --chown on the COPY itself, never a `RUN chown -R` afterwards: rewriting the
-# ownership of 1.6 GB of node_modules in a later layer duplicates every byte of
-# it in the image.
+# ownership of node_modules in a later layer duplicates every byte of it.
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node package.json ./
 
-# The engine keeps its database under $HOME; job checkouts land in TMPDIR.
-RUN mkdir -p /data && chown node:node /data
-
 USER node
 
-EXPOSE 8080
-
-# /healthz is the HTTP layer only. It answers before the engine is reachable, so
-# the start period below has to cover the engine's boot rather than racing it.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
-# tini reaps the engine child; without an init, a killed engine lingers as a
-# zombie and the next start finds :6420 taken.
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "dist/scripts/serve.js"]
+# Deliberately absent: EXPOSE, HEALTHCHECK, VOLUME. A run has no inbound
+# surface to expose, nothing to health-check between jobs, and nothing worth
+# keeping when it exits.
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "dist/src/entry.js"]

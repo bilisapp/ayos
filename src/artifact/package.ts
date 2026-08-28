@@ -1,7 +1,6 @@
 import { git, sanitizeGitDir } from "../git/clone.ts";
 import { truncateText } from "../events/schema.ts";
-import type { Sandbox } from "../sandbox.ts";
-import { WORKDIR } from "../git/clone.ts";
+import { exec } from "../exec.ts";
 
 export interface DiffResult {
   diff: string;
@@ -13,16 +12,17 @@ export interface DiffResult {
 /**
  * Stage everything (so new files appear) and diff against the pinned base.
  *
- * Runs on the HOST against the checkout the VM has mounted: the agent's edits
- * land in that directory through the mount, and the host has real git. Ayos
- * never commits — the caller owns the write path.
+ * The agent edited this working tree in place; `git` here is the container's
+ * real git, run with the hardened config in `git/clone.ts` because `.git` is
+ * agent-writable and therefore untrusted. Ayos never commits — the caller owns
+ * the write path.
  */
 export async function packageDiff(
   hostPath: string,
   baseSha: string,
   maxDiffLines: number,
 ): Promise<DiffResult> {
-  // `.git` is agent-writable through the mount, so it is untrusted from here on.
+  // `.git` is agent-writable, so it is untrusted from here on.
   await sanitizeGitDir(hostPath);
 
   await git(hostPath, ["add", "-A"]);
@@ -67,17 +67,20 @@ export interface TestRun {
 const TAIL_BYTES = 8192;
 
 /**
- * Runs the caller's test command inside the VM, against the mounted checkout.
- * Never throws on a failing test — a red suite is a result, not an error.
+ * Runs the caller's test command against the checkout. Never throws on a
+ * failing test — a red suite is a result, not an error.
+ *
+ * `exec` puts the shell in its own process group and kills the group on
+ * timeout, so a suite that forks cannot outlive the job budget.
  */
 export async function runTests(
-  sandbox: Sandbox,
+  cwd: string,
   cmd: string,
   opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<TestRun> {
   const started = Date.now();
-  const res = await sandbox.exec("sh", ["-lc", cmd], {
-    cwd: WORKDIR,
+  const res = await exec("sh", ["-lc", cmd], {
+    cwd,
     timeoutMs: opts.timeoutMs,
     signal: opts.signal,
   });
@@ -91,9 +94,12 @@ export async function runTests(
 }
 
 /**
- * The binary a test command needs on PATH. agentOS's guest ships coreutils and
- * friends but no language runtimes, so this is what the preflight check looks
- * for before we let a job get as far as reporting a confusing test failure.
+ * The binary a test command needs on PATH.
+ *
+ * The runner image carries git and a Node runtime and nothing else — verifying
+ * the patch is still the caller's CI's job. The preflight check that uses this
+ * fails such a job immediately and says so, rather than letting the caller read
+ * a confusing "tests failed" caused by a missing interpreter.
  */
 export function requiredToolFor(testCmd: string): string | null {
   const first = testCmd.trim().split(/\s+/)[0] ?? "";

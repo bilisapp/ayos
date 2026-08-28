@@ -21,6 +21,7 @@ function spec(o: Overrides = {}): JobSpec {
     base_ref: "main",
     base_sha: "abc1234",
     clone_token: "ghs_token_value_here_0123456789",
+    signing_key: "A".repeat(43) + "=",
     llm_key: "sk-ant-key",
     task: {
       instructions: o.instructions ?? "Fix the null pointer in OrderService::total().",
@@ -107,6 +108,11 @@ describe("buildSystemPrompt", () => {
     expect(p).toMatch(/Do not add, upgrade, or remove dependencies/i);
     expect(p).toMatch(/Never write outside the cloned repository/i);
     expect(p).toMatch(/Make no network calls/i);
+    // ...and does NOT claim an egress control that no longer exists. An agent
+    // that disproves one rule with a single `curl` has learned what the rest
+    // of them are worth.
+    expect(p).not.toMatch(/egress/i);
+    expect(p).not.toMatch(/will simply fail/i);
     expect(p).toMatch(/Never reveal, log, echo, or copy credentials/i);
     expect(p).toMatch(/STOP and report/);
     expect(p).toMatch(/Do not commit, push, create branches, or open pull requests/);

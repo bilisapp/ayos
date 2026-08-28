@@ -1,9 +1,8 @@
 import { type JobSpec, type Artifact, type JobState } from "../types.ts";
-import type { SandboxProvider, Sandbox } from "../sandbox.ts";
-import { egressAllowlistFor, registriesForTestCmd } from "../sandbox.ts";
 import type { AgentSessionFactory } from "../agent/session.ts";
 import { buildSystemPrompt, buildUserPrompt, randomNonce } from "../agent/prompt.ts";
-import { shallowClone, WORKDIR, CloneError, type Checkout } from "../git/clone.ts";
+import { shallowClone, CloneError, type Checkout } from "../git/clone.ts";
+import { revokeCloneToken, type RevokeResult } from "../git/revoke.ts";
 import {
   packageDiff,
   runTests,
@@ -11,42 +10,40 @@ import {
   requiredToolFor,
   type TestRun,
 } from "../artifact/package.ts";
+import { exec } from "../exec.ts";
 import { makeRedactor } from "../events/redact.ts";
 import { truncateText, MAX_TOOL_RESULT_BYTES, type EventType } from "../events/schema.ts";
 
 export interface EmitFn {
-  (
-    type: EventType,
-    data: Record<string, unknown>,
-    options?: { durability?: "durable" | "ephemeral" },
-  ): void;
+  (type: EventType, data: Record<string, unknown>): void;
 }
 
 export interface RunnerDeps {
-  sandboxes: SandboxProvider;
   agents: AgentSessionFactory;
-  /** Called for every event, already redacted. The host buffers and broadcasts. */
+  /** Called for every event, already redacted. The caller batches and ships them. */
   emit: EmitFn;
-  /** Called on every state transition, so the host can persist it. */
+  /** Called on every state transition. */
   onState: (state: JobState) => void;
   defaultTimeoutS: number;
   gitHost?: string;
-  llmHost?: string;
+  /** Injectable so a test never talks to GitHub. */
+  revoke?: (token: string) => Promise<RevokeResult>;
   now?: () => number;
 }
 
 const EMPTY_DURATIONS = { clone_ms: 0, agent_ms: 0, test_ms: 0 };
 
 /**
- * Where the agent's model calls go. Overridable per job (`llm_host`) and per
- * deployment (`deps.llmHost`) — it is only the fallback, and it is the single
- * place to change if the agent runtime talks to a different endpoint.
- */
-export const DEFAULT_LLM_HOST = "api.anthropic.com";
-
-/**
  * Drives one job start to finish. Never throws: every failure path produces an
  * artifact, because the caller is waiting for exactly one of those.
+ *
+ * The phase machine is unchanged from the VM design — clone, agent, test,
+ * package, deliver — but the containment underneath it is not. There is no VM
+ * and no egress allowlist: the whole container is the sandbox, single-tenant
+ * and thrown away at the end of this one job. What survives is everything that
+ * protects the OUTPUT rather than the host: the diff is computed by us and not
+ * by the agent, `.git` is treated as hostile, the denylist and line cap are
+ * enforced after the fact, and nothing here can push.
  */
 export async function runJob(
   spec: JobSpec,
@@ -54,12 +51,12 @@ export async function runJob(
   externalSignal?: AbortSignal,
 ): Promise<Artifact> {
   const now = deps.now ?? Date.now;
-  const redactor = makeRedactor([spec.clone_token, spec.llm_key]);
+  const redactor = makeRedactor([spec.clone_token, spec.llm_key, spec.signing_key]);
   const timeoutMs = (spec.constraints.timeout_s ?? deps.defaultTimeoutS) * 1000;
+  const revoke = deps.revoke ?? ((token: string) => revokeCloneToken(token));
 
   const durations = { ...EMPTY_DURATIONS };
   let state: JobState = "queued";
-  let sandbox: Sandbox | null = null;
   let checkout: Checkout | null = null;
   let summary = "";
   let diff: string | null = null;
@@ -80,8 +77,8 @@ export async function runJob(
   const remainingMs = () => Math.max(1_000, deadline - now());
   const timer = setTimeout(() => abortFor("timeout"), timeoutMs);
 
-  const emit: EmitFn = (type, data, options) =>
-    deps.emit(type, redactor.redactValue(data) as Record<string, unknown>, options);
+  const emit: EmitFn = (type, data) =>
+    deps.emit(type, redactor.redactValue(data) as Record<string, unknown>);
 
   const setState = (next: JobState) => {
     state = next;
@@ -111,15 +108,15 @@ export async function runJob(
         durations,
         links: spec.task.links,
       },
-      // The host owns the event log (it has the ring buffer); it fills this in.
+      // Filled in by the entrypoint, which owns the event log.
       events: [],
     };
   };
 
   try {
-    // 1. Clone FIRST, on the host. The VM's git cannot diff (see git/clone.ts),
-    //    so the tree is cloned here and mounted into the VM — which also means
-    //    the clone token never enters the VM at all.
+    // 1. Clone. Still the first thing that happens, and still with the token
+    //    delivered through a one-shot GIT_ASKPASS script rather than argv or
+    //    .git/config.
     setState("cloning");
     try {
       checkout = await shallowClone({
@@ -138,61 +135,67 @@ export async function runJob(
     durations.clone_ms = checkout.durationMs;
     emit("phase", { state: "cloning", done: true, duration_ms: durations.clone_ms });
 
-    // 2. Provision, with the checkout mounted and egress narrowed to exactly
-    //    what this job needs.
-    const llmHost = spec.llm_host ?? deps.llmHost ?? DEFAULT_LLM_HOST;
-    const egress = egressAllowlistFor({
-      llmHost,
-      registries: registriesForTestCmd(spec.constraints.test_cmd),
-    });
-    emit("phase", { state: "queued", egress });
-    sandbox = await deps.sandboxes.provision({
-      jobId: spec.job_id,
-      egressAllowlist: egress,
-      hostRepoPath: checkout.hostPath,
-      signal: controller.signal,
+    // 2. Kill the clone token, before the agent exists.
+    //
+    //    The VM design kept the token out of the sandbox entirely. One
+    //    container per job cannot: the agent's `bash` runs beside this code.
+    //    Revocation replaces isolation with time — by the agent's first tool
+    //    call the credential is already dead. Best effort: the token is
+    //    `contents: read` on one repository and expires within the hour
+    //    regardless, so a failed revocation is reported, not fatal.
+    const revocation = await revoke(spec.clone_token);
+    emit("phase", {
+      state: "cloning",
+      token_revoked: revocation.revoked,
+      ...(revocation.revoked ? {} : { revoke_status: revocation.status, revoke_error: revocation.error }),
     });
 
-    // The VM ships coreutils but no language runtimes. Fail here, plainly,
+    // The image carries git and node, not language runtimes. Fail here, plainly,
     // rather than letting the caller read "tests failed" and go hunting.
     if (spec.constraints.test_cmd) {
       const tool = requiredToolFor(spec.constraints.test_cmd);
       if (tool) {
-        const probe = await sandbox.exec("sh", ["-lc", `command -v ${tool}`], {
+        const probe = await exec("sh", ["-lc", `command -v ${tool}`], {
           timeoutMs: Math.min(30_000, remainingMs()),
           signal: controller.signal,
         });
         if (probe.exitCode !== 0)
           return finish("failed", {
             error:
-              `test_cmd requires \`${tool}\`, which is not available in the agentOS VM. ` +
+              `test_cmd requires \`${tool}\`, which is not installed in the runner image. ` +
               `Set test_cmd to null and run tests in your CI instead.`,
           });
       }
     }
 
-    // 3. Agent session.
+    // 3. Agent session, rooted in the checkout.
     setState("fixing");
     const nonce = randomNonce();
     const agentStart = now();
     const session = await deps.agents.create({
-      sandbox,
-      cwd: WORKDIR,
+      cwd: checkout.hostPath,
+      llmProvider: spec.llm_provider,
       llmKey: spec.llm_key,
       llmHost: spec.llm_host,
+      // A real system prompt at last: Pi's SDK takes one, where its ACP adapter
+      // silently dropped `additionalInstructions`. The invariants no longer
+      // have to masquerade as the opening of the first user turn.
+      systemPrompt: buildSystemPrompt(spec, nonce),
       signal: controller.signal,
     });
     try {
       const result = await session.run({
-        systemPrompt: buildSystemPrompt(spec, nonce),
         userPrompt: buildUserPrompt(spec, nonce),
         signal: controller.signal,
         onTurn: (turn) => {
           const data =
             turn.type === "tool_result"
-              ? { ...turn.data, output: truncateText(String(turn.data.output ?? ""), MAX_TOOL_RESULT_BYTES) }
+              ? {
+                  ...turn.data,
+                  output: truncateText(String(turn.data.output ?? ""), MAX_TOOL_RESULT_BYTES),
+                }
               : turn.data;
-          emit(turn.type, data, { durability: turn.durability });
+          emit(turn.type, data);
         },
       });
       summary = result.summary;
@@ -205,10 +208,10 @@ export async function runJob(
     // 4. Verify.
     if (spec.constraints.test_cmd) {
       setState("testing");
-      // The job-level timer aborts the run, but an abort does not stop a
-      // process already running in the VM: the command needs its own cap, or a
-      // hanging test_cmd holds the VM and a concurrency slot indefinitely.
-      tests = await runTests(sandbox, spec.constraints.test_cmd, {
+      // The job-level timer aborts the run, but the command needs its own cap
+      // too: `exec` kills the process GROUP, so a suite that forks cannot
+      // outlive the budget by detaching from the shell that started it.
+      tests = await runTests(checkout.hostPath, spec.constraints.test_cmd, {
         timeoutMs: remainingMs(),
         signal: controller.signal,
       });
@@ -219,7 +222,11 @@ export async function runJob(
 
     // 5. Package.
     setState("packaging");
-    const packaged = await packageDiff(checkout.hostPath, spec.base_sha, spec.constraints.max_diff_lines);
+    const packaged = await packageDiff(
+      checkout.hostPath,
+      spec.base_sha,
+      spec.constraints.max_diff_lines,
+    );
     diff = packaged.diff || null;
     filesTouched = packaged.filesTouched;
 
@@ -245,10 +252,8 @@ export async function runJob(
     });
   } finally {
     clearTimeout(timer);
-    // 7. Dispose. Nothing persists in Ayos beyond actor state — the VM is
-    //    destroyed (idle sleep would keep its filesystem) and the host checkout,
-    //    which still holds the repo, is deleted.
-    await sandbox?.dispose().catch(() => {});
+    // The container is about to exit, but the checkout still holds the repo and
+    // an aborted run may not reach that exit promptly — delete it here.
     await checkout?.cleanup().catch(() => {});
     void state;
   }
